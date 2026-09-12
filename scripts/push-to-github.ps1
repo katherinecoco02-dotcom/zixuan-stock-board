@@ -67,8 +67,19 @@ $headers = @{
 try {
   $me = Invoke-RestMethod -Uri 'https://api.github.com/user' -Headers $headers -TimeoutSec 30
 } catch {
-  Bad "token 无效或无权访问 GitHub API：$($_.Exception.Message)"
-  Say "  常见原因：token 过期、未勾 repo 权限、或已被撤销。"
+  # 不要把任何异常都当成"token 无效" —— 受限环境里 .NET 的 TLS 可能连不上 GitHub，
+  # 那时 token 其实没问题（本机就踩过这个坑）。据实区分。
+  $msg = $_.Exception.Message
+  if ($msg -match '基础连接|TLS|SSL|schannel|超时|timeout|无法连接|name resolution|远程名称') {
+    Bad "连不上 api.github.com —— 这是网络/TLS 问题，不是 token 的问题：$msg"
+    Say "  办法一：在网页手工建好仓库，再用 -SkipCreate 参数只做推送"
+    Say "          （推送走 git 自己的 TLS，通常不受影响）"
+    Say "  办法二：若 git 报 schannel SEC_E_NO_CREDENTIALS，给本仓库换 OpenSSL 后端："
+    Say "          git config --local http.sslBackend openssl"
+  } else {
+    Bad "token 无效或无权访问 GitHub API：$msg"
+    Say "  常见原因：token 过期、未勾 repo 权限、或已被撤销。"
+  }
   exit 1
 }
 $login = $me.login
@@ -123,13 +134,16 @@ Ok "当前分支：$branch"
 & $git -C $Root remote add origin "https://github.com/$full.git"
 
 Say "  正在推送（首次会传全部文件）..."
-# 用一次性 URL 推送：token 不进 .git/config，也不会留在 remote 里
-& $git -C $Root push "https://$token@github.com/$full.git" "$branch`:refs/heads/$branch" --set-upstream 2>&1 |
+# 用一次性 URL 推送：token 不进 .git/config，也不会留在 remote 里。
+# 显式指定 openssl 后端：本机实测 git 默认的 schannel 在受限环境下会报
+# `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` 而连不上 GitHub。
+& $git -C $Root -c http.sslBackend=openssl push "https://$token@github.com/$full.git" "$branch`:refs/heads/$branch" --set-upstream 2>&1 |
   ForEach-Object { $_ -replace [regex]::Escape($token), '***' }   # 万一 git 回显了 URL，也替换掉
 if ($LASTEXITCODE -ne 0) {
   Bad "推送失败（退出码 $LASTEXITCODE）"
-  Say "  常见原因：token 没有 repo 权限、仓库名冲突、或网络问题。"
-  Say "  注意：若刚才是因为远端已有内容而失败，可能需要先 pull 或强推。"
+  Say "  若报 schannel / SEC_E_NO_CREDENTIALS：这是 TLS 后端问题，本脚本已改用 openssl；"
+  Say "  若仍失败，可手工执行：git config --local http.sslBackend openssl 后重试。"
+  Say "  其他常见原因：token 没有 repo 权限、远端已有内容（需先 pull 或强推）。"
   exit 1
 }
 Ok "推送完成"
