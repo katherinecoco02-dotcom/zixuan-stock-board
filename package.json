@@ -1,0 +1,26 @@
+{
+  "name": "zixuan-stock-board",
+  "version": "1.0.0",
+  "private": true,
+  "description": "自选股看板 —— 基于同花顺金融数据服务的本地看板：左侧自选股列表 + 右侧 K 线（点击即切、不跳页）、四宫格多周期、盘面复盘、选股筛选、策略回测、价格预警",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "mcp-check": "node scripts/mcp-check.mjs",
+    "test:offline": "node scripts/chart-test.mjs && node scripts/ring-test.mjs",
+    "test": "node scripts/chart-test.mjs && node scripts/ring-test.mjs && node scripts/e2e-test.mjs && node scripts/ma-screener-test.mjs && node scripts/screener-extra-test.mjs && node scripts/alert-test.mjs"
+  },
+  "keywords": [
+    "a-share",
+    "stock",
+    "kline",
+    "dashboard",
+    "hithink",
+    "同花顺"
+  ],
+  "license": "MIT"
+}

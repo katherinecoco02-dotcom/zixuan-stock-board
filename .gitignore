@@ -1,0 +1,28 @@
+# ---- 凭据：绝不允许提交 ----
+.apikey
+*.apikey
+credentials.env
+.env
+
+# ---- 本地私有状态 ----
+# data/ 里是使用者自己的自选股、价格预警、运行日志与 pid
+# 每个使用者各不相同，且属于隐私，绝不进仓库
+/data/
+
+# ---- 记忆与 agent 配置（本地私有，见 ~/.dsh/AGENTS.md）----
+/memory/
+/AGENTS.md
+
+# ---- 可重新拉取的数据 ----
+.cache/
+
+# ---- Node ----
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

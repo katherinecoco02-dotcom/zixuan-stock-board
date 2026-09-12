@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自选股看板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <div id="viewbar">
+      <button data-view="watchlist" class="active">自选股</button>
+      <button data-view="quad">四宫格</button>
+      <button data-view="review">盘面复盘</button>
+      <button data-view="screener">选股筛选</button>
+      <button data-view="backtest">策略回测</button>
+      <button data-view="alerts">价格预警</button>
+    </div>
+
+    <!-- ============ 视图一：自选股 ============ -->
+    <aside id="sidebar-watchlist" class="sidebar">
+      <div class="side-head">
+        <h1>自选股</h1>
+        <span id="count" class="badge">0</span>
+      </div>
+
+      <div class="add-box">
+        <textarea id="add-input" rows="2" placeholder="批量添加：代码或名称，逗号/空格/换行分隔&#10;例：600519 000001 贵州茅台"></textarea>
+        <button id="add-btn">添加</button>
+      </div>
+      <div id="add-result" class="add-result"></div>
+
+      <ul id="list" class="list"></ul>
+
+      <div class="side-foot">
+        <span id="quote-status">加载中…</span>
+        <button id="refresh-btn" title="立即刷新行情">刷新</button>
+      </div>
+    </aside>
+
+    <!-- ============ 视图二：盘面复盘 ============ -->
+    <aside id="sidebar-review" class="sidebar" hidden>
+      <div class="side-head">
+        <h1>盘面复盘</h1>
+        <span id="review-date" class="badge">—</span>
+      </div>
+      <div class="side-foot review-foot">
+        <input type="date" id="review-date-input" title="选择要复盘的历史交易日">
+        <span id="review-status">尚未加载</span>
+        <button id="review-refresh">刷新</button>
+      </div>
+      <div id="review-panels" class="review-panels"></div>
+    </aside>
+
+    <!-- ============ 视图三：选股筛选 ============ -->
+    <aside id="sidebar-screener" class="sidebar" hidden>
+      <div class="side-head">
+        <h1>选股筛选</h1>
+        <span id="screener-count" class="badge">—</span>
+      </div>
+      <div class="filter-form">
+        <details class="fs-group" open>
+          <summary>行情 <span class="dim">快照直出，零额外请求</span></summary>
+        <label><span>价格</span>
+          <input id="fs-minPrice" type="number" step="0.01" placeholder="最低">
+          <i>~</i>
+          <input id="fs-maxPrice" type="number" step="0.01" placeholder="最高">
+        </label>
+        <label><span>涨跌幅%</span>
+          <input id="fs-minPct" type="number" step="0.1" placeholder="最低">
+          <i>~</i>
+          <input id="fs-maxPct" type="number" step="0.1" placeholder="最高">
+        </label>
+        <label><span>成交额(亿)</span>
+          <input id="fs-minAmountYi" type="number" step="0.1" placeholder="最低">
+          <i>~</i>
+          <input id="fs-maxAmountYi" type="number" step="0.1" placeholder="最高">
+        </label>
+        <label><span>振幅%</span>
+          <input id="fs-minAmplitude" type="number" step="0.5" placeholder="最低">
+          <i>~</i>
+          <input id="fs-maxAmplitude" type="number" step="0.5" placeholder="最高">
+        </label>
+        <label><span>跳空%</span>
+          <input id="fs-minGap" type="number" step="0.5" placeholder="如 -3 低开">
+          <i>~</i>
+          <input id="fs-maxGap" type="number" step="0.5" placeholder="如 3 高开">
+        </label>
+        <label><span>收盘强度%</span>
+          <input id="fs-minCloseStrength" type="number" step="5" placeholder="如 80">
+          <i>~</i>
+          <input id="fs-maxCloseStrength" type="number" step="5" placeholder="最高">
+        </label>
+        <label><span>阴阳线</span>
+          <select id="fs-candle">
+            <option value="">不限</option>
+            <option value="yang">收阳线（收 ≥ 开）</option>
+            <option value="yin">收阴线（收 &lt; 开）</option>
+          </select>
+        </label>
+        <div class="form-row">
+          <label class="chk"><input type="checkbox" id="fs-excludeSt" checked> 排除 ST</label>
+        </div>
+        </details>
+
+        <details class="fs-group">
+          <summary>估值 <span class="dim">按成交额前 200 只</span></summary>
+        <label><span>PE(TTM)</span>
+          <input id="fs-minPe" type="number" step="1" placeholder="最低">
+          <i>~</i>
+          <input id="fs-maxPe" type="number" step="1" placeholder="最高">
+        </label>
+        <label><span>PB</span>
+          <input id="fs-minPb" type="number" step="0.1" placeholder="最低">
+          <i>~</i>
+          <input id="fs-maxPb" type="number" step="0.1" placeholder="最高">
+        </label>
+        </details>
+
+        <details class="fs-group">
+          <summary>均线 <span class="dim">需逐只取 K 线，扫描前 N 只</span></summary>
+        <label><span>均线参照</span>
+          <select id="fs-maRef">
+            <option value="">不限</option>
+            <option value="5">MA5</option>
+            <option value="10">MA10</option>
+            <option value="20">MA20</option>
+            <option value="30">MA30</option>
+            <option value="60">MA60</option>
+          </select>
+        </label>
+        <label><span>偏离%</span>
+          <input id="fs-maDevMin" type="number" step="1" placeholder="如 -100">
+          <i>~</i>
+          <input id="fs-maDevMax" type="number" step="1" placeholder="如 -20">
+        </label>
+        <label><span>均线排列</span>
+          <select id="fs-maAlign">
+            <option value="">不限</option>
+            <option value="bull">多头排列（MA5&gt;10&gt;20&gt;30&gt;60）</option>
+            <option value="bear">空头排列（MA5&lt;10&lt;20&lt;30&lt;60）</option>
+          </select>
+        </label>
+        <label><span>金叉/死叉</span>
+          <select id="fs-maCross">
+            <option value="">不限</option>
+            <option value="golden">近 N 日内金叉（MA5 上穿 MA10）</option>
+            <option value="death">近 N 日内死叉（MA5 下穿 MA10）</option>
+          </select>
+        </label>
+        <label><span>N 日</span>
+          <input id="fs-maCrossWithin" type="number" step="1" min="1" max="60" value="5">
+        </label>
+        <label><span>扫描数</span>
+          <input id="fs-maScan" type="number" step="50" min="20" max="600" value="150">
+        </label>
+        <div class="form-row preset-row">
+          <button type="button" class="mini" data-ma-preset="below20">低于MA60 20%以上</button>
+          <button type="button" class="mini" data-ma-preset="notBelow">不低于MA60</button>
+          <button type="button" class="mini" data-ma-preset="golden">MA5 金叉</button>
+        </div>
+        </details>
+
+        <details class="fs-group">
+          <summary>资金与情绪 <span class="dim">各 1 次全市场请求</span></summary>
+        <label><span>涨停</span>
+          <select id="fs-limitUp">
+            <option value="">不限</option>
+            <option value="1">仅今日涨停</option>
+          </select>
+        </label>
+        <label><span>连板数 ≥</span>
+          <input id="fs-minBoards" type="number" step="1" min="2" max="20" placeholder="如 2">
+        </label>
+        <label><span>炸板/跌停</span>
+          <select id="fs-breakDown">
+            <option value="">不限</option>
+            <option value="break">仅今日炸板</option>
+            <option value="down">仅今日跌停</option>
+          </select>
+        </label>
+        <label><span>龙虎榜</span>
+          <select id="fs-dt">
+            <option value="">不限</option>
+            <option value="all">仅上榜</option>
+            <option value="org">机构净买 &gt; 0</option>
+            <option value="hot">游资净买 &gt; 0</option>
+          </select>
+        </label>
+        <label><span>热榜前 N</span>
+          <input id="fs-hotTop" type="number" step="5" min="1" max="30" placeholder="如 30">
+        </label>
+        <label><span>异动标签</span>
+          <select id="fs-anomaly">
+            <option value="">不限</option>
+            <option value="LIMIT_UP">涨停</option>
+            <option value="LIMIT_DOWN">跌停</option>
+            <option value="SHARP_RISE">急涨</option>
+            <option value="SHARP_FALL">急跌</option>
+            <option value="RAPID_RALLY">快速拉升</option>
+            <option value="RAPID_DECLINE">快速回落</option>
+          </select>
+        </label>
+        </details>
+
+        <div class="form-row">
+          <button id="fs-run" class="primary">开始筛选</button>
+        </div>
+        <div class="hint">
+          <b>行情</b>类零额外请求；<b>资金与情绪</b>类各 1 次全市场请求；
+          <b>均线</b>类需逐只取历史 K 线，只扫成交额前 N 只（冷缓存约 15 秒，之后走缓存秒出）；
+          <b>估值</b>类按成交额前 200 只（上游每次限 100 只）。每个阶段的实际数量都会如实报出。
+        </div>
+      </div>
+      <div id="screener-status" class="add-result"></div>
+      <div id="screener-results" class="scroll-area"></div>
+    </aside>
+
+    <!-- ============ 视图四：策略回测 ============ -->
+    <aside id="sidebar-backtest" class="sidebar" hidden>
+      <div class="side-head">
+        <h1>策略回测</h1>
+        <span id="bt-count" class="badge">—</span>
+      </div>
+      <div class="filter-form">
+        <label><span>标的</span>
+          <input id="bt-codes" type="text" placeholder="留空 = 当前自选股池">
+        </label>
+        <label><span>快线 / 慢线</span>
+          <input id="bt-fast" type="number" value="5">
+          <i>/</i>
+          <input id="bt-slow" type="number" value="20">
+        </label>
+        <label><span>区间(天)</span>
+          <input id="bt-days" type="number" value="730">
+        </label>
+        <label><span>初始资金</span>
+          <input id="bt-capital" type="number" value="100000">
+        </label>
+        <label><span>手续费率</span>
+          <input id="bt-fee" type="number" step="0.0001" value="0.0003">
+        </label>
+        <div class="form-row">
+          <button id="bt-run" class="primary">运行回测</button>
+        </div>
+        <div class="hint">双均线金叉买入 / 死叉卖出，信号次日开盘成交（避免未来函数），满仓进出、双边计费。点结果里的股票名可在右侧看到买卖点标记。</div>
+      </div>
+      <div id="bt-status" class="add-result"></div>
+      <div id="bt-results" class="scroll-area"></div>
+    </aside>
+
+    <!-- ============ 视图五：价格预警 ============ -->
+    <aside id="sidebar-alerts" class="sidebar" hidden>
+      <div class="side-head">
+        <h1>价格预警</h1>
+        <span id="alert-count" class="badge">0</span>
+      </div>
+
+      <div id="alert-monitor" class="alert-monitor">—</div>
+
+      <div class="filter-form">
+        <label><span>股票</span>
+          <input id="al-input" type="text" placeholder="代码或名称，如 002212 天融信">
+        </label>
+        <label><span>方向</span>
+          <select id="al-direction">
+            <option value="below">跌到（≤ 目标价）</option>
+            <option value="above">涨到（≥ 目标价）</option>
+          </select>
+        </label>
+        <label><span>目标价</span>
+          <input id="al-target" type="number" step="0.01" min="0.01" placeholder="如 6.20">
+        </label>
+        <label><span>备注</span>
+          <input id="al-note" type="text" placeholder="可选，如「支撑位」">
+        </label>
+        <div class="form-row">
+          <button id="al-add" class="primary">添加预警</button>
+          <button id="al-check" title="非交易时段也判定一次">立即检查一次</button>
+          <button id="al-beep" title="试听铃声（三音一段、连响三遍）">试听铃</button>
+        </div>
+        <div class="hint">
+          服务端每 10 秒取一次快照（上游只有快照行情，没有 tick），
+          <b>只在交易时段（09:15–11:30 / 13:00–15:00）判定</b>，收盘后不触发、避免用收盘价误报。
+          触发一次后会标记「已触发」，点「复位」才会再次生效。
+        </div>
+      </div>
+
+      <div id="al-status" class="add-result"></div>
+      <div id="al-list" class="scroll-area"></div>
+    </aside>
+  </div>
+
+  <!-- ============ 单图视图 ============ -->
+  <main id="main">
+    <header id="main-head">
+      <div class="title">
+        <span id="sel-name">未选择</span>
+        <span id="sel-code" class="code"></span>
+      </div>
+      <div id="sel-price-box" class="price-box">—</div>
+      <button id="add-current" hidden>加入自选</button>
+    </header>
+
+    <div class="toolbar">
+      <div class="group" id="period-group">
+        <button data-period="day" class="active">日</button>
+        <button data-period="week">周</button>
+        <button data-period="month">月</button>
+        <button data-period="quarter">季</button>
+        <button data-period="year">年</button>
+      </div>
+      <div class="group" id="range-group">
+        <button data-days="90">3月</button>
+        <button data-days="180">6月</button>
+        <button data-days="365" class="active">1年</button>
+        <button data-days="730">2年</button>
+        <button data-days="1825">5年</button>
+        <button data-days="3650">10年</button>
+      </div>
+      <div class="group" id="adjust-group">
+        <button data-adjust="forward" class="active">前复权</button>
+        <button data-adjust="none">不复权</button>
+        <button data-adjust="backward">后复权</button>
+      </div>
+      <div class="spacer"></div>
+      <div id="chart-info" class="chart-info">—</div>
+    </div>
+
+    <div id="chart-wrap">
+      <canvas id="chart"></canvas>
+      <div id="chart-empty" class="empty">从左侧选择一只股票</div>
+      <div id="chart-loading" class="loading" hidden>加载中…</div>
+    </div>
+
+    <div id="stats" class="stats"></div>
+  </main>
+
+  <!-- ============ 四宫格视图：同一只股票的多个周期 ============ -->
+  <section id="quad-view" hidden>
+    <div class="toolbar">
+      <div class="group">
+        <button data-days="90">3月</button>
+        <button data-days="180">6月</button>
+        <button data-days="365" class="active">1年</button>
+        <button data-days="730">2年</button>
+        <button data-days="1825">5年</button>
+        <button data-days="3650">10年</button>
+      </div>
+      <div class="group">
+        <button data-adjust="forward" class="active">前复权</button>
+        <button data-adjust="none">不复权</button>
+        <button data-adjust="backward">后复权</button>
+      </div>
+      <div class="spacer"></div>
+      <div id="quad-hint" class="chart-info">点左侧自选股，四格同步显示该股的不同周期</div>
+    </div>
+    <div id="quad-grid" class="quad-grid"></div>
+  </section>
+</div>
+<div id="toast-wrap"></div>
+<script src="/chart.js"></script>
+<script src="/ring.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

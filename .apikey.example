@@ -1,0 +1,9 @@
+# 把这一行改成你自己的 API Key，然后把文件重命名为 .apikey（去掉 .example）
+#
+# 获取地址：https://fuyao.aicubes.cn/admin/
+#   —— 需要用**同花顺账号**登录后才能签发，Key 与账号绑定，每人一把。
+#
+# 注意：
+#   1. 只需一行，不要加引号、不要留多余空行
+#   2. .apikey 已被 .gitignore 忽略，不会被提交
+#   3. 也可以用环境变量 HITHINK_FINANCE_API_KEY 代替本文件
