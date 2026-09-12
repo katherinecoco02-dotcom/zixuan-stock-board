@@ -3,8 +3,10 @@
 *.apikey
 credentials.env
 .env
-.git-token
+# 注意：用记事本另存为时 Windows 会自动补 .txt，所以用通配而不是精确名
+.git-token*
 *.token
+*.token.txt
 .github-token
 
 # ---- 本地私有状态 ----
