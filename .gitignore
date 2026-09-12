@@ -3,6 +3,9 @@
 *.apikey
 credentials.env
 .env
+.git-token
+*.token
+.github-token
 
 # ---- 本地私有状态 ----
 # data/ 里是使用者自己的自选股、价格预警、运行日志与 pid
