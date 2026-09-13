@@ -235,5 +235,75 @@ liveWrap.clientHeight = 400;
 chartE.draw();
 ok(chartE.visibleCount() === 0, '宽度不足（30px）时同样跳过绘制');
 
+console.log('\n=== 15) 分时模式：时间轴映射 ===');
+// 造一个交易日的 6 个点：9:30 / 10:30 / 11:30 / 13:00 / 14:00 / 15:00
+const shSec = (h, m) => Math.floor(Date.UTC(2026, 8, 14, h - 8, m, 0) / 1000);
+const intraday = {
+  date: '2026-09-14',
+  prevClose: 100,
+  t: [shSec(9, 30), shSec(10, 30), shSec(11, 30), shSec(13, 0), shSec(14, 0), shSec(15, 0)],
+  p: [100, 102, 101, 101.5, 98, 99],
+  v: [1000, 2000, 3000, 3500, 4000, 5000],
+  to: [100000, 203000, 303000, 353500, 391500, 494000],
+  avg: [100, 101.5, 101, 101.14, 97.88, 98.8],
+  m: [0, 60, 120, 120, 180, 240],
+};
+const canvasI = makeCanvas(900, 420);
+const chartI = new KlineChart(canvasI, { compact: false });
+chartI.setIntraday(intraday);
+
+ok(chartI.isIntraday === true, 'setIntraday 后进入分时模式');
+const gi = chartI._geomCache;
+ok(Boolean(gi) && gi.intraday === true, '几何缓存标记为 intraday');
+ok(gi.n === 6, `点数 = ${gi.n}`);
+
+const iL = 6;
+const iR = 80;
+const x0 = iL;
+const x240 = 900 - iR;
+const plotW = x240 - x0;
+const near = (a, b, tol = 0.5) => Math.abs(a - b) < tol;
+ok(near(gi.xs[0], x0), `9:30 落在最左（${gi.xs[0].toFixed(1)} ≈ ${x0}）`);
+ok(near(gi.xs[5], x240), `15:00 落在最右（${gi.xs[5].toFixed(1)} ≈ ${x240}）`);
+ok(near(gi.xs[1], x0 + plotW * 0.25), `10:30 在 1/4 处（${gi.xs[1].toFixed(1)}）`);
+// 关键性质：中午休市不占宽度，11:30 与 13:00 必须落在同一个 x
+ok(near(gi.xs[2], gi.xs[3], 0.01), `11:30 与 13:00 同一位置（${gi.xs[2].toFixed(1)}）—— 休市不占宽度`);
+ok(near(gi.xs[2], x0 + plotW * 0.5), `半天分界在正中间（${gi.xs[2].toFixed(1)}）`);
+
+console.log('\n=== 16) 分时：悬停取最近点 + 信息字段 ===');
+const rectI = canvasI.getBoundingClientRect();
+chartI._onMove({ clientX: rectI.left + gi.xs[4] });
+ok(chartI.hoverIndex === 4, `鼠标落在第 5 点 → hoverIndex=${chartI.hoverIndex}`);
+const inf = chartI.infoAt(4);
+ok(inf.intraday === true, 'infoAt 返回分时形状');
+ok(inf.time === '14:00', `时间格式化正确：${inf.time}`);
+ok(near(inf.dev, -2, 0.01), `相对昨收偏离：${inf.dev.toFixed(2)}%（98 / 100）`);
+ok(near(inf.avgDev, -2.12, 0.05), `均价偏离：${inf.avgDev.toFixed(2)}%`);
+ok(near(inf.price, 98, 0.001) && near(inf.avg, 97.88, 0.001), '价格与均价读取正确');
+
+console.log('\n=== 17) 分时：边界与模式切换 ===');
+const emptyI = new KlineChart(makeCanvas(900, 420), {});
+emptyI.setIntraday({ t: [], p: [] });
+ok(emptyI.visibleCount() === 0 && emptyI.isIntraday === false, '空分时：不绘制、不抛异常');
+
+// 从分时切回 K 线，模式必须复位（否则会继续按分时渲染）
+chartI.setData({ items, displayStartMs, period: 'day' });
+ok(chartI.isIntraday === false, 'setData 后退出分时模式');
+ok(chartI.visibleCount() === 200, `K 线恢复正常绘制（${chartI.visibleCount()} 根）`);
+
+// 只有一个点
+const oneI = new KlineChart(makeCanvas(900, 420), {});
+oneI.setIntraday({ t: [shSec(9, 30)], p: [100], v: [1], avg: [100], m: [0], prevClose: 100 });
+ok(oneI._geomCache?.n === 1, '单点分时：几何缓存正常，不抛异常');
+
+// 昨收缺失时应回退用首价做基准，而不是画出 NaN
+const noPc = new KlineChart(makeCanvas(900, 420), {});
+noPc.setIntraday({
+  t: [shSec(9, 30), shSec(10, 0)], p: [50, 51], v: [1, 2], avg: [50, 50.5],
+  m: [0, 30], prevClose: null,
+});
+const infN = noPc.infoAt(1);
+ok(Number.isFinite(infN.dev), `昨收缺失时基准回退到首价，偏离 = ${infN.dev.toFixed(2)}%`);
+
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项。`);
 process.exit(fail > 0 ? 1 : 0);

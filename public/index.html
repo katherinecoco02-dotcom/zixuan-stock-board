@@ -305,6 +305,7 @@
 
     <div class="toolbar">
       <div class="group" id="period-group">
+        <button data-period="intraday">分时</button>
         <button data-period="day" class="active">日</button>
         <button data-period="week">周</button>
         <button data-period="month">月</button>
@@ -324,6 +325,10 @@
         <button data-adjust="none">不复权</button>
         <button data-adjust="backward">后复权</button>
       </div>
+      <div class="group" id="intraday-date-group" hidden>
+        <input type="date" id="intraday-date" title="回放已录制的分时（只列已采集的日期）">
+        <button id="intraday-latest">最新</button>
+      </div>
       <div class="spacer"></div>
       <div id="chart-info" class="chart-info">—</div>
     </div>
@@ -340,7 +345,7 @@
   <!-- ============ 四宫格视图：同一只股票的多个周期 ============ -->
   <section id="quad-view" hidden>
     <div class="toolbar">
-      <div class="group">
+      <div class="group" id="quad-range-group">
         <button data-days="90">3月</button>
         <button data-days="180">6月</button>
         <button data-days="365" class="active">1年</button>
@@ -348,10 +353,14 @@
         <button data-days="1825">5年</button>
         <button data-days="3650">10年</button>
       </div>
-      <div class="group">
+      <div class="group" id="quad-adjust-group">
         <button data-adjust="forward" class="active">前复权</button>
         <button data-adjust="none">不复权</button>
         <button data-adjust="backward">后复权</button>
+      </div>
+      <div class="group" id="quad-intraday-date-group" hidden>
+        <input type="date" id="quad-intraday-date" title="回放已录制的分时">
+        <button id="quad-intraday-latest">最新</button>
       </div>
       <div class="spacer"></div>
       <div id="quad-hint" class="chart-info">点左侧自选股，四格同步显示该股的不同周期</div>

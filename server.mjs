@@ -11,7 +11,7 @@
  */
 
 import { createServer } from 'node:http';
-import { readFile, writeFile, mkdir, appendFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, appendFile, readdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -503,6 +503,182 @@ function startAlertMonitor() {
   tick();
   alertTimer = setInterval(tick, ALERT_INTERVAL_MS);
   console.log(`[alert] 价格预警监控已启动，间隔 ${ALERT_INTERVAL_MS / 1000} 秒（仅交易时段判定）`);
+}
+
+// ---------------------------------------------------------------- 分时采样（自建分时图的数据来源）
+
+/**
+ * 上游**没有** A 股分钟数据（`high-frequency` 全部返回 code=2004「AI 客户端专用」，
+ * 日线接口传 interval=1m 直接 1002 报错），所以分时图只能**自己采样攒**：
+ * 交易时段内定期取一次快照，把价格/成交量/成交额按时间追加到当天文件里。
+ *
+ * 存储：`data/intraday/YYYY-MM-DD.jsonl`，**一行一个采样点**（追加写，O(1)），
+ * 首行/新增标的时补一行 meta 记昨收。这样每天一个文件、可永久回放。
+ * 采样间隔默认 30 秒（一天约 480 点，够画分时），可用 INTRADAY_INTERVAL_MS 调整。
+ */
+const INTRADAY_DIR = path.join(DATA_DIR, 'intraday');
+const INTRADAY_INTERVAL_MS = Math.max(Number(process.env.INTRADAY_INTERVAL_MS ?? 30_000) || 30_000, 3_000);
+
+const intradayMonitor = {
+  intervalMs: INTRADAY_INTERVAL_MS,
+  startedAt: null,
+  lastTickAt: null,
+  lastSampleAt: null,
+  samples: 0,
+  ticks: 0,
+  skippedClosed: 0,
+  errors: 0,
+  lastError: null,
+};
+
+/** 上海时区的 YYYY-MM-DD */
+function shDate(ms = Date.now()) {
+  const y = shanghaiNow(ms).ymd;
+  return `${y.slice(0, 4)}-${y.slice(4, 6)}-${y.slice(6, 8)}`;
+}
+
+function intradayFile(date) {
+  return path.join(INTRADAY_DIR, `${date}.jsonl`);
+}
+
+/**
+ * 某个时刻对应"盘中第几分钟"：9:30 = 0，11:30 = 120，13:00 = 120，15:00 = 240。
+ * 这样横轴可以按 0~240 固定铺满，不同股票、不同日期画出来的形状能直接对比
+ * （和行情软件的分时图一致：中午休市不占宽度）。开盘前（集合竞价）一律算 0。
+ */
+function sessionMinuteOf(ms) {
+  const m = shanghaiNow(ms).minutes;
+  if (m < 9 * 60 + 30) return 0;
+  if (m <= 11 * 60 + 30) return m - (9 * 60 + 30);
+  if (m < 13 * 60) return 120;
+  return 120 + Math.min(120, m - 13 * 60);
+}
+
+let intradayTimer = null;
+
+async function intradayTick() {
+  const forced = process.env.INTRADAY_FORCE_SESSION === '1';
+  const session = await marketSession();
+  if (!session.open && !forced) {
+    intradayMonitor.skippedClosed += 1;
+    return;
+  }
+
+  const items = await loadWatchlist();
+  const codes = items.map((i) => i.thscode);
+  if (!codes.length) return;
+
+  const snap = await client.snapshot(codes); // 自选股一次批量快照
+  const rows = snap?.item ?? [];
+  if (!rows.length) return;
+
+  const now = Date.now();
+  const date = shDate(now);
+  await mkdir(INTRADAY_DIR, { recursive: true });
+
+  const quotes = {};
+  const prevClose = {};
+  for (const r of rows) {
+    const code = String(r.thscode ?? '').toUpperCase();
+    if (!code) continue;
+    const p = Number(r.last_price);
+    if (!Number.isFinite(p) || p <= 0) continue; // 停牌/无行情不记，避免画出一条假的 0 线
+    quotes[code] = [p, Number(r.volume) || 0, Number(r.turnover) || 0];
+    const pc = Number(r.prev_price);
+    if (Number.isFinite(pc) && pc > 0) prevClose[code] = pc;
+  }
+  if (!Object.keys(quotes).length) return;
+
+  const line = JSON.stringify({ t: Math.floor(now / 1000), q: quotes }) + '\n';
+  await appendFile(intradayFile(date), line, 'utf8');
+
+  // meta 每次都补一行（读取端取最后一条），这样盘中新加的自选股也能有昨收
+  const metaLine = JSON.stringify({ meta: true, date, prevClose }) + '\n';
+  await appendFile(intradayFile(date), metaLine, 'utf8');
+
+  intradayMonitor.samples += Object.keys(quotes).length;
+  intradayMonitor.ticks += 1;
+  intradayMonitor.lastSampleAt = new Date().toISOString();
+}
+
+function startIntradayRecorder() {
+  if (intradayTimer) return;
+  const tick = async () => {
+    try {
+      await intradayTick();
+      intradayMonitor.lastError = null;
+    } catch (err) {
+      intradayMonitor.errors += 1;
+      intradayMonitor.lastError = String(err?.message ?? err);
+      console.error(`[intraday] 采样异常：${intradayMonitor.lastError}`);
+    } finally {
+      intradayMonitor.lastTickAt = new Date().toISOString();
+    }
+  };
+  intradayMonitor.startedAt = new Date().toISOString();
+  tick();
+  intradayTimer = setInterval(tick, INTRADAY_INTERVAL_MS);
+  console.log(`[intraday] 分时采样已启动，间隔 ${INTRADAY_INTERVAL_MS / 1000} 秒（仅交易时段采集自选股，按天存 data/intraday/）`);
+}
+
+/** 读某天的分时：返回 { date, prevClose, series: { code: {t[],p[],v[],to[]} } } */
+async function loadIntradayDay(date) {
+  const file = intradayFile(date);
+  let text = null;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch {
+    return null;
+  }
+  const prevClose = {};
+  const series = {};
+  for (const raw of text.split('\n')) {
+    const s = raw.trim();
+    if (!s) continue;
+    let row;
+    try {
+      row = JSON.parse(s);
+    } catch {
+      continue; // 半行（写入中断）直接跳过，不让一行坏数据废掉整天
+    }
+    if (row.meta) {
+      Object.assign(prevClose, row.prevClose ?? {});
+      continue;
+    }
+    if (!row.q || !row.t) continue;
+    for (const [code, v] of Object.entries(row.q)) {
+      const s2 = (series[code] ??= { t: [], p: [], v: [], to: [] });
+      if (s2.t.length && s2.t[s2.t.length - 1] >= row.t) continue; // 同一/倒退时间戳不重复记
+      s2.t.push(row.t);
+      s2.p.push(v[0]);
+      s2.v.push(v[1]);
+      s2.to.push(v[2]);
+    }
+  }
+  return { date, prevClose, series };
+}
+
+/** 已录制的日期清单（含每个日期录了多少股票、多少点、文件多大） */
+async function listIntradayDates() {
+  let names = [];
+  try {
+    names = await readdir(INTRADAY_DIR);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const n of names) {
+    const m = n.match(/^(\d{4}-\d{2}-\d{2})\.jsonl$/);
+    if (!m) continue;
+    const file = path.join(INTRADAY_DIR, n);
+    let bytes = 0;
+    try {
+      bytes = (await stat(file)).size;
+    } catch { /* ignore */ }
+    out.push({ date: m[1], bytes, file });
+  }
+  out.sort((a, b) => b.date.localeCompare(a.date));
+  return out;
 }
 
 /** 一条预警的实时对照：现价、是否已满足、距离目标还差多少（>0 表示还没到）。 */
@@ -1644,6 +1820,58 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, { removed: before - store.items.length, ...(await alertsPayload()) });
     }
 
+    // ---- 分时（自建采样）----
+    // 上游没有 A 股分钟数据，所以分时图的数据是服务自己按时采样的结果，按天存盘。
+    if (p === '/api/intraday/dates' && req.method === 'GET') {
+      const dates = await listIntradayDates();
+      return sendJson(res, 200, {
+        dates: dates.map((d) => ({ date: d.date, bytes: d.bytes })),
+        intervalSec: INTRADAY_INTERVAL_MS / 1000,
+        monitor: {
+          startedAt: intradayMonitor.startedAt,
+          lastSampleAt: intradayMonitor.lastSampleAt,
+          ticks: intradayMonitor.ticks,
+          samples: intradayMonitor.samples,
+          skippedClosed: intradayMonitor.skippedClosed,
+          errors: intradayMonitor.errors,
+          lastError: intradayMonitor.lastError,
+        },
+        dir: INTRADAY_DIR,
+      });
+    }
+
+    if (p === '/api/intraday' && req.method === 'GET') {
+      const thscode = (url.searchParams.get('thscode') ?? '').trim().toUpperCase();
+      if (!thscode) return sendJson(res, 400, { error: '缺少 thscode' });
+      let date = (url.searchParams.get('date') ?? '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        const dates = await listIntradayDates();
+        date = dates[0]?.date ?? '';
+      }
+      if (!date) {
+        return sendJson(res, 200, { thscode, date: null, count: 0, hasData: false, reason: '尚无任何分时记录' });
+      }
+      const day = await loadIntradayDay(date);
+      const s = day?.series?.[thscode];
+      if (!s || !s.t.length) {
+        return sendJson(res, 200, {
+          thscode, date, count: 0, hasData: false,
+          reason: day ? '该日期未录到这只股票（分时只采自选股）' : '该日期没有记录',
+        });
+      }
+      // 均价线（VWAP）= 累计成交额 / 累计成交量：上游给的就是当日累计值，直接相除即可
+      const avg = s.to.map((to, i) => (s.v[i] > 0 ? to / s.v[i] : null));
+      return sendJson(res, 200, {
+        thscode,
+        date,
+        prevClose: day.prevClose[thscode] ?? null,
+        count: s.t.length,
+        hasData: true,
+        t: s.t, p: s.p, v: s.v, to: s.to, avg,
+        m: s.t.map((sec) => sessionMinuteOf(sec * 1000)),
+      });
+    }
+
     // 健康检查
     if (p === '/api/health') {
       return sendJson(res, 200, {
@@ -1673,5 +1901,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Key 来源： ${client.keySource}`);
   console.log(`自选股文件： ${WATCHLIST_FILE}`);
   console.log(`预警文件： ${ALERTS_FILE}`);
+  console.log(`分时目录： ${INTRADAY_DIR}`);
   startAlertMonitor();
+  startIntradayRecorder();
 });

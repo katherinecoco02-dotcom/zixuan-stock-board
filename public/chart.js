@@ -43,6 +43,12 @@
     return withYear ? `${String(d.getFullYear()).slice(2)}/${mm}/${dd}` : `${mm}/${dd}`;
   }
 
+  /** 把 epoch 秒按上海时区（UTC+8）格式化成 HH:MM */
+  function hhmm(sec) {
+    const d = new Date((sec + 8 * 3600) * 1000);
+    return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+  }
+
   /** 简单移动平均；前 period-1 根为 null。 */
   function computeMA(items, period) {
     const out = new Array(items.length).fill(null);
@@ -71,6 +77,9 @@
       // 独立缩放：每张图各自维护，互不影响
       this.zoomCount = null;   // 显示多少根；null = 用默认窗口
       this.zoomStart = null;   // 窗口在 base 中的起始下标；null = 右对齐到最新
+      // 分时模式：数据是服务端自己按时采样的（上游没有 A 股分钟线）
+      this.mode = 'kline';     // 'kline' | 'intraday'
+      this.intraday = null;
 
       canvas.addEventListener('mousemove', (e) => this._onMove(e));
       canvas.addEventListener('mouseleave', () => this._onLeave());
@@ -95,6 +104,25 @@
     /** 当前可见的 bar 数组（供外部显示统计） */
     visibleBars() {
       return this._geomCache ? this._geomCache.view : [];
+    }
+
+    /**
+     * 切到分时模式。数据形如
+     *   { t:[秒], p:[价], v:[累计量], avg:[均价], m:[盘中第几分钟], prevClose, date }
+     * 分时不支持缩放（横轴固定铺满一个交易日，和行情软件一致）。
+     */
+    setIntraday(d) {
+      this.mode = 'intraday';
+      this.intraday = d && d.t && d.t.length ? d : null;
+      this.hoverIndex = null;
+      this._geomCache = null;
+      this.draw();
+      this._notifyView();
+    }
+
+    /** 当前是否分时模式且有数据 */
+    get isIntraday() {
+      return this.mode === 'intraday' && Boolean(this.intraday);
     }
 
     /** 恢复为默认窗口（双击画布） */
@@ -153,6 +181,8 @@
       if (period) this.period = period;
       this.hoverIndex = null;
       this._geomCache = null;
+      this.mode = 'kline';       // 从分时切回 K 线时必须复位，否则会继续按分时渲染
+      this.intraday = null;
       // 缩放的“级别”（显示多少根）作为该图的查看偏好保留；起始位置重置为右对齐最新
       this.zoomStart = null;
       this.draw();
@@ -174,8 +204,20 @@
       const g = this._geomCache;
       if (!g || !g.n) return;
       const rect = this.canvas.getBoundingClientRect();
-      const raw = Math.floor((e.clientX - rect.left - g.padL) / g.step);
-      const i = raw < 0 ? 0 : raw >= g.n ? g.n - 1 : raw;
+      const mx = e.clientX - rect.left;
+      let i;
+      if (g.intraday) {
+        // 分时的点按时间摆放、间距不等，必须找最近的点而不是按等距下标算
+        i = 0;
+        let best = Infinity;
+        for (let k = 0; k < g.xs.length; k++) {
+          const dist = Math.abs(g.xs[k] - mx);
+          if (dist < best) { best = dist; i = k; }
+        }
+      } else {
+        const raw = Math.floor((mx - g.padL) / g.step);
+        i = raw < 0 ? 0 : raw >= g.n ? g.n - 1 : raw;
+      }
       if (this.hoverIndex === i) return;
       this.hoverIndex = i;
       this.draw();
@@ -189,10 +231,38 @@
       if (this.onHover) this.onHover(null);
     }
 
-    /** 某根 bar 的摘要信息（供外部显示）。 */
+    /** 把 epoch 秒按上海时区（UTC+8）格式化成 HH:MM */
+    _hhmm(sec) {
+      return hhmm(sec);
+    }
+
+    /** 某个点的摘要信息（供外部显示）。分时与 K 线返回不同形状。 */
     infoAt(i) {
       const g = this._geomCache;
-      if (!g || i === null || i === undefined || !g.view[i]) return null;
+      if (!g || i === null || i === undefined) return null;
+
+      if (g.intraday) {
+        const d = this.intraday;
+        if (!d || d.t[i] === undefined) return null;
+        const pc = Number(d.prevClose) || Number(d.p[0]);
+        const price = Number(d.p[i]);
+        const avg = d.avg?.[i] ?? null;
+        return {
+          intraday: true,
+          index: i,
+          time: this._hhmm(d.t[i]),
+          minute: d.m?.[i] ?? 0,
+          price,
+          avg,
+          prevClose: pc,
+          dev: pc ? ((price - pc) / pc) * 100 : null,
+          avgDev: avg != null && pc ? ((avg - pc) / pc) * 100 : null,
+          volume: d.v?.[i] ?? 0,
+          turnover: d.to?.[i] ?? 0,
+        };
+      }
+
+      if (!g.view || !g.view[i]) return null;
       const bar = g.view[i];
       const o = Number(bar.open_price);
       const c = Number(bar.close_price);
@@ -211,6 +281,210 @@
       };
     }
 
+    /**
+     * 分时渲染：横轴固定铺满一个交易日（0~240 分钟，中午休市不占宽度），
+     * 纵轴按**昨收的百分比**对称展开（0% 居中），画价格线 + 均价线 + 成交量柱，
+     * 与行情软件的分时图口径一致。
+     */
+    _drawIntraday(W, H) {
+      const canvas = this.canvas;
+      const ctx = this.ctx;
+      const d = this.intraday;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(W * dpr);
+      canvas.height = Math.floor(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+
+      if (!d || !d.p || !d.p.length) {
+        this._geomCache = null;
+        return;
+      }
+
+      const compact = this.compact;
+      const n = d.p.length;
+      const pc = Number(d.prevClose) || Number(d.p[0]);
+      const devOf = (x) => (x == null || !pc ? null : ((Number(x) - pc) / pc) * 100);
+
+      // 纵轴范围：至少 ±0.2%（避免一条直线顶满屏），再留 10% 余量并取整到 0.1
+      let maxAbs = 0.2;
+      for (let i = 0; i < n; i++) {
+        const a = devOf(d.p[i]);
+        if (a != null) maxAbs = Math.max(maxAbs, Math.abs(a));
+        const b = devOf(d.avg?.[i]);
+        if (b != null) maxAbs = Math.max(maxAbs, Math.abs(b));
+      }
+      maxAbs = Math.ceil(maxAbs * 1.1 * 10) / 10;
+
+      const padL = 6;
+      const padR = compact ? 60 : 80;
+      const padT = compact ? 8 : 24;
+      const padB = compact ? 16 : 22;
+      const gap = compact ? 6 : 10;
+      const usableH = H - padT - padB;
+      const volH = Math.max(compact ? 18 : 34, usableH * (compact ? 0.2 : 0.22));
+      const priceH = usableH - volH - gap;
+      const priceTop = padT;
+      const priceBot = padT + priceH;
+      const volTop = priceBot + gap;
+      const volBot = volTop + volH;
+
+      const xOf = (m) => padL + (Math.max(0, Math.min(240, m)) / 240) * (W - padL - padR);
+      const yOf = (dev) => priceBot - ((dev + maxAbs) / (2 * maxAbs)) * priceH;
+
+      const xs = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const m = d.m?.[i];
+        xs[i] = xOf(m === undefined ? (n === 1 ? 240 : (i / (n - 1)) * 240) : m);
+      }
+      this._geomCache = { intraday: true, n, xs, padL, padR, priceTop, priceBot, volTop, volBot };
+
+      // ---- 右轴底色
+      ctx.fillStyle = '#0f1621';
+      ctx.fillRect(W - padR, 0, padR, H);
+      ctx.strokeStyle = '#2a3646';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(W - padR + 0.5, 0);
+      ctx.lineTo(W - padR + 0.5, H);
+      ctx.stroke();
+
+      // ---- 网格 + 双刻度（上行百分比、下行对应价格）
+      const steps = compact ? 3 : 4;
+      ctx.font = `${compact ? 10 : 12}px Consolas, "Microsoft YaHei", monospace`;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      for (let k = -steps; k <= steps; k++) {
+        const dev = (maxAbs * k) / steps;
+        const y = Math.round(yOf(dev)) + 0.5;
+        const zero = k === 0;
+        ctx.strokeStyle = zero ? 'rgba(133,149,168,0.5)' : 'rgba(35,47,63,0.6)';
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(W - padR, y);
+        ctx.stroke();
+        ctx.strokeStyle = '#3d4c60';
+        ctx.beginPath();
+        ctx.moveTo(W - padR, y);
+        ctx.lineTo(W - padR + 5, y);
+        ctx.stroke();
+        ctx.fillStyle = dev > 0 ? UP : dev < 0 ? DOWN : '#8595a8';
+        ctx.fillText(`${dev > 0 ? '+' : ''}${dev.toFixed(2)}%`, W - padR + 9, y - (compact ? 5 : 6));
+        ctx.fillStyle = '#dbe4ef';
+        ctx.fillText((pc * (1 + dev / 100)).toFixed(2), W - padR + 9, y + (compact ? 6 : 7));
+      }
+      // 成交量区分隔
+      ctx.strokeStyle = 'rgba(42,54,70,0.9)';
+      ctx.beginPath();
+      ctx.moveTo(padL, Math.round(volTop) + 0.5);
+      ctx.lineTo(W - padR, Math.round(volTop) + 0.5);
+      ctx.stroke();
+
+      // ---- 成交量柱（按与上一个采样点的涨跌着色）
+      let maxVol = 0;
+      for (let i = 0; i < n; i++) maxVol = Math.max(maxVol, Number(d.v?.[i]) || 0);
+      const barW = Math.max(1, Math.min((W - padL - padR) / 240, compact ? 3 : 4));
+      for (let i = 0; i < n; i++) {
+        const v = Number(d.v?.[i]) || 0;
+        if (!v || !maxVol) continue;
+        const h = (v / maxVol) * volH;
+        const rising = i === 0 ? true : Number(d.p[i]) >= Number(d.p[i - 1]);
+        ctx.fillStyle = rising ? 'rgba(229,72,77,0.65)' : 'rgba(38,162,105,0.65)';
+        ctx.fillRect(xs[i] - barW / 2, volBot - h, barW, h);
+      }
+
+      // ---- 均价线（先画，压在价格线下面）
+      if (d.avg) {
+        ctx.strokeStyle = '#e8b339';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        let started = false;
+        for (let i = 0; i < n; i++) {
+          const dev = devOf(d.avg[i]);
+          if (dev == null) { started = false; continue; }
+          const px = xs[i];
+          const py = yOf(dev);
+          if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+      }
+
+      // ---- 价格线
+      ctx.strokeStyle = '#d7dee8';
+      ctx.lineWidth = compact ? 1 : 1.4;
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) {
+        const dev = devOf(d.p[i]);
+        if (dev == null) continue;
+        const px = xs[i];
+        const py = yOf(dev);
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+
+      // ---- 横轴时间刻度
+      ctx.fillStyle = '#a9b6c7';
+      ctx.font = `${compact ? 10 : 12}px Consolas, "Microsoft YaHei", monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const marks = compact
+        ? [[0, '9:30'], [120, '11:30/13:00'], [240, '15:00']]
+        : [[0, '9:30'], [60, '10:30'], [120, '11:30 / 13:00'], [180, '14:00'], [240, '15:00']];
+      for (const [m, label] of marks) {
+        const px = xOf(m);
+        if (px < padL + 12 || px > W - padR - 12) continue;
+        ctx.fillText(label, px, H - padB + 4);
+      }
+
+      // ---- 顶部图例
+      if (!compact) {
+        const li = this.hoverIndex !== null && this.hoverIndex < n ? this.hoverIndex : n - 1;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.font = '12px Consolas, "Microsoft YaHei", monospace';
+        const dev = devOf(d.p[li]);
+        const adev = devOf(d.avg?.[li]);
+        let lx = padL + 2;
+        ctx.fillStyle = '#8595a8';
+        const head = `分时 ${d.date ?? ''}  昨收 ${pc.toFixed(2)}`;
+        ctx.fillText(head, lx, 12);
+        lx += ctx.measureText(head).width + 14;
+        ctx.fillStyle = dev != null && dev >= 0 ? UP : DOWN;
+        const t1 = `${this._hhmm(d.t[li])} ${Number(d.p[li]).toFixed(2)} ${dev > 0 ? '+' : ''}${dev.toFixed(2)}%`;
+        ctx.fillText(t1, lx, 12);
+        lx += ctx.measureText(t1).width + 14;
+        if (adev != null) {
+          ctx.fillStyle = '#e8b339';
+          ctx.fillText(`均价 ${Number(d.avg[li]).toFixed(2)} ${adev > 0 ? '+' : ''}${adev.toFixed(2)}%`, lx, 12);
+        }
+      }
+
+      // ---- 十字光标
+      if (this.hoverIndex !== null && this.hoverIndex < n) {
+        const i = this.hoverIndex;
+        const dev = devOf(d.p[i]);
+        const cx = xs[i];
+        const cy = dev == null ? priceBot : yOf(dev);
+        ctx.save();
+        ctx.strokeStyle = 'rgba(215,222,232,0.5)';
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(cx + 0.5, priceTop);
+        ctx.lineTo(cx + 0.5, volBot);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(padL, cy + 0.5);
+        ctx.lineTo(W - padR, cy + 0.5);
+        ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = '#d7dee8';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
     draw() {
       const canvas = this.canvas;
       const wrap = canvas.parentElement;
@@ -222,6 +496,7 @@
         this._geomCache = null;
         return;
       }
+      if (this.mode === 'intraday') return this._drawIntraday(W, H);
       const dpr = window.devicePixelRatio || 1;
       canvas.width = Math.floor(W * dpr);
       canvas.height = Math.floor(H * dpr);
@@ -491,5 +766,5 @@
   window.KLINE_MA_STYLE = MA_STYLE_FULL;
   window.KLINE_MA_STYLE_COMPACT = MA_STYLE_COMPACT;
   window.KLINE_PERIOD_LABEL = PERIOD_LABEL;
-  window.KLINE_FMT = { n2, fmtVol, fmtDate };
+  window.KLINE_FMT = { n2, fmtVol, fmtDate, hhmm };
 })();

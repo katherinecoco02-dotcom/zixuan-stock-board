@@ -65,6 +65,8 @@ const state = {
   items: [],          // 自选股列表（含行情）
   selected: null,     // 当前选中 thscode
   kline: null,        // { thscode, name, items, adjust }
+  intraday: null,     // 分时（服务自己采样的）：{ t, p, v, avg, m, prevClose, date, count }
+  intradayDate: '',   // 空 = 最新已录制日期
   days: 365,
   period: 'day',      // day | week | month | quarter | year
   adjust: 'forward',
@@ -239,20 +241,36 @@ async function loadKline() {
   el.empty.hidden = true;
 
   try {
-    // 均线预热由服务端按周期折算负责，前端只要显示窗口
-    const url =
-      `/api/kline?thscode=${encodeURIComponent(code)}&days=${state.days}` +
-      `&adjust=${state.adjust}&period=${state.period}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-    // 请求返回期间用户可能已经切到别的股票，丢弃过期响应
-    if (state.selected !== code) return;
-    state.kline = data;
-    renderHeader();
+    if (state.period === 'intraday') {
+      // 分时数据不是上游的分钟线，而是服务自己按时采样攒的，走另一个接口
+      const q = state.intradayDate ? `&date=${encodeURIComponent(state.intradayDate)}` : '';
+      const res = await fetch(`/api/intraday?thscode=${encodeURIComponent(code)}${q}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      if (state.selected !== code) return;
+      state.intraday = data;
+      state.kline = null;
+      renderHeader();
+    } else {
+      // 均线预热由服务端按周期折算负责，前端只要显示窗口
+      const url =
+        `/api/kline?thscode=${encodeURIComponent(code)}&days=${state.days}` +
+        `&adjust=${state.adjust}&period=${state.period}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      // 请求返回期间用户可能已经切到别的股票，丢弃过期响应
+      if (state.selected !== code) return;
+      state.kline = data;
+      renderHeader();
+    }
   } catch (err) {
     if (state.selected === code) {
-      state.kline = { thscode: code, items: [], displayStartMs: 0, error: err.message };
+      if (state.period === 'intraday') {
+        state.intraday = { thscode: code, hasData: false, reason: err.message, count: 0 };
+      } else {
+        state.kline = { thscode: code, items: [], displayStartMs: 0, error: err.message };
+      }
     }
     console.error(err);
   } finally {
@@ -553,12 +571,45 @@ function displayedBars(items, displayStartMs) {
 }
 
 function setChartInfo(info) {
+  if (info.intraday) {
+    const dev = info.dev;
+    const adev = info.avgDev;
+    const cls = dev > 0 ? 'up' : dev < 0 ? 'down' : '';
+    const acls = adev > 0 ? 'up' : adev < 0 ? 'down' : '';
+    el.chartInfo.innerHTML =
+      `${info.time}　价 <b class="${cls}">${KF.n2(info.price)}</b>　` +
+      `<b class="${cls}">${dev === null ? '—' : `${dev > 0 ? '+' : ''}${dev.toFixed(2)}%`}</b>　` +
+      `均价 <b class="${acls}">${KF.n2(info.avg)}</b>　量 ${KF.fmtVol(info.volume)}`;
+    return;
+  }
   el.chartInfo.innerHTML =
     `${info.date}　开 ${KF.n2(info.open)}　高 ${KF.n2(info.high)}　低 ${KF.n2(info.low)}　收 ${KF.n2(info.close)}　` +
     `量 ${KF.fmtVol(info.volume)}`;
 }
 
 function resetChartInfo() {
+  if (state.period === 'intraday') {
+    const d = state.intraday;
+    if (!d?.hasData) {
+      el.chartInfo.textContent = '—';
+      return;
+    }
+    const i = d.t.length - 1;
+    const pc = Number(d.prevClose) || Number(d.p[i]);
+    const price = Number(d.p[i]);
+    const avg = d.avg?.[i] ?? null;
+    setChartInfo({
+      intraday: true,
+      time: KF.hhmm(d.t[i]),
+      index: i,
+      price,
+      avg,
+      dev: pc ? ((price - pc) / pc) * 100 : null,
+      avgDev: avg != null && pc ? ((avg - pc) / pc) * 100 : null,
+      volume: d.v?.[i] ?? 0,
+    });
+    return;
+  }
   const bars = displayedBars(state.kline?.items, state.kline?.displayStartMs);
   const last = bars[bars.length - 1];
   if (!last) {
@@ -576,6 +627,8 @@ function resetChartInfo() {
 }
 
 function renderMainChart() {
+  if (state.period === 'intraday') return renderMainIntraday();
+
   const k = state.kline;
   const bars = k?.items ?? [];
 
@@ -602,6 +655,8 @@ function renderMainChart() {
 }
 
 function updateStats() {
+  if (state.period === 'intraday') return updateIntradayStats();
+
   // 用「当前可见」的 bar，而不是默认窗口 —— 滚轮缩放后数字要跟着变
   const bars = mainChart.visibleBars();
   if (!bars.length) {
@@ -630,7 +685,93 @@ function updateStats() {
     markerNote;
 }
 
+// ---------------------------------------------------------------- 分时（自建采样）
+
+/** 分时视图：数据来自服务端按天采样的文件，不是上游的分钟线 */
+function renderMainIntraday() {
+  const d = state.intraday;
+  const showEmpty = (text) => {
+    mainChart.clear();
+    el.empty.hidden = false;
+    el.empty.textContent = text;
+    el.stats.innerHTML = '';
+    el.chartInfo.textContent = '—';
+  };
+
+  if (!d) return showEmpty(state.selected ? '暂无分时数据' : '从左侧选择一只股票');
+  if (d.error) return showEmpty(`加载失败：${d.error}`);
+  if (!d.hasData) return showEmpty(d.reason ? `暂无分时：${d.reason}` : '暂无分时数据');
+
+  el.empty.hidden = true;
+  mainChart.setIntraday(d);
+  resetChartInfo();
+  updateStats();
+}
+
+function updateIntradayStats() {
+  const d = state.intraday;
+  if (!d?.hasData) {
+    el.stats.innerHTML = '';
+    return;
+  }
+  const i = d.t.length - 1;
+  const pc = Number(d.prevClose) || Number(d.p[i]);
+  const price = Number(d.p[i]);
+  const avg = d.avg?.[i] ?? null;
+  const dev = pc ? ((price - pc) / pc) * 100 : null;
+  const adev = avg != null && pc ? ((avg - pc) / pc) * 100 : null;
+  const hi = Math.max(...d.p);
+  const lo = Math.min(...d.p);
+  const cDev = (v) => (v > 0 ? 'up' : v < 0 ? 'down' : '');
+
+  el.stats.innerHTML =
+    `<span>日期 <b>${d.date}</b></span>` +
+    `<span>采样 <b>${d.count}</b> 点</span>` +
+    `<span>昨收 <b>${pc.toFixed(2)}</b></span>` +
+    `<span>现价 <b class="${cDev(dev)}">${price.toFixed(2)}　${dev > 0 ? '+' : ''}${dev.toFixed(2)}%</b></span>` +
+    `<span>均价 <b class="${cDev(adev)}">${avg == null ? '—' : `${avg.toFixed(2)}　${adev > 0 ? '+' : ''}${adev.toFixed(2)}%`}</b></span>` +
+    `<span>日内 <b>${lo.toFixed(2)} ~ ${hi.toFixed(2)}</b></span>` +
+    `<span class="dim">分时由本服务按时采样绘制（上游无 A 股分钟数据）</span>`;
+}
+
+/** 拉取已录制的分时日期，用来限定日期选择器的可选范围 */
+async function refreshIntradayDates() {
+  try {
+    const r = await fetch('/api/intraday/dates');
+    const d = await r.json();
+    state.intradayDates = d.dates ?? [];
+    state.intradayMonitor = d.monitor;
+    const newest = state.intradayDates[0]?.date ?? '';
+    const oldest = state.intradayDates[state.intradayDates.length - 1]?.date ?? '';
+    for (const id of ['intraday-date', 'quad-intraday-date']) {
+      const inp = $(id);
+      if (!inp) continue;
+      inp.min = oldest;
+      inp.max = newest;
+    }
+    return state.intradayDates;
+  } catch {
+    state.intradayDates = [];
+    return [];
+  }
+}
+
+/** 分时模式下：区间/复权按钮无意义，换成日期选择器 */
+function syncPeriodUI() {
+  const isIntraday = state.period === 'intraday';
+  for (const id of ['range-group', 'adjust-group', 'quad-range-group', 'quad-adjust-group']) {
+    const n = $(id);
+    if (n) n.hidden = isIntraday;
+  }
+  for (const id of ['intraday-date-group', 'quad-intraday-date-group']) {
+    const n = $(id);
+    if (n) n.hidden = !isIntraday;
+  }
+  if (isIntraday) refreshIntradayDates();
+}
+
 // ---------------------------------------------------------------- 四宫格（同一只股票的多周期同屏）
+
 
 const QUAD_SLOTS = 4;
 const QUAD_DEFAULT_PERIODS = ['day', 'week', 'month', 'year'];
@@ -661,10 +802,10 @@ function buildQuad() {
 
     const select = document.createElement('select');
     select.className = 'quad-period';
-    for (const p of ['day', 'week', 'month', 'quarter', 'year']) {
+    for (const p of ['intraday', 'day', 'week', 'month', 'quarter', 'year']) {
       const opt = document.createElement('option');
       opt.value = p;
-      opt.textContent = `${PERIOD_LABEL[p]}线`;
+      opt.textContent = p === 'intraday' ? '分时' : `${PERIOD_LABEL[p]}线`;
       select.appendChild(opt);
     }
     select.value = quadState.periods[i];
@@ -791,6 +932,21 @@ async function loadQuadSlot(i) {
   cell.classList.add('loading');
 
   try {
+    if (period === 'intraday') {
+      const q = state.intradayDate ? `&date=${encodeURIComponent(state.intradayDate)}` : '';
+      const res = await fetch(`/api/intraday?thscode=${encodeURIComponent(code)}${q}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      if (quadState.code !== code || quadState.periods[i] !== period) return;
+      if (!data.hasData) {
+        quadState.meta[i] = { reason: data.reason ?? '无分时数据' };
+        chart.clear();
+      } else {
+        quadState.meta[i] = { last: { close_price: data.p[data.p.length - 1] }, bars: data.count };
+        chart.setIntraday(data);
+      }
+      return;
+    }
     const url =
       `/api/kline?thscode=${encodeURIComponent(code)}&days=${state.days}` +
       `&adjust=${state.adjust}&period=${period}`;
@@ -1741,6 +1897,7 @@ document.addEventListener('click', (e) => {
   if (period) {
     state.period = period.dataset.period;
     syncGroups();
+    syncPeriodUI();     // 分时要隐藏区间/复权、显示日期选择器
     reloadCharts();
     return;
   }
@@ -1768,7 +1925,34 @@ window.addEventListener('resize', () => {
 
 // ---------------------------------------------------------------- 启动
 
+// 分时日期选择器（单图与四宫格各一个，共享同一个 state.intradayDate）
+for (const [inpId, btnId] of [['intraday-date', 'intraday-latest'], ['quad-intraday-date', 'quad-intraday-latest']]) {
+  const inp = $(inpId);
+  const btn = $(btnId);
+  if (inp) {
+    inp.addEventListener('change', () => {
+      state.intradayDate = inp.value || '';
+      for (const id of ['intraday-date', 'quad-intraday-date']) {
+        const other = $(id);
+        if (other && other !== inp) other.value = state.intradayDate;
+      }
+      reloadCharts();
+    });
+  }
+  if (btn) {
+    btn.addEventListener('click', () => {
+      state.intradayDate = '';
+      for (const id of ['intraday-date', 'quad-intraday-date']) {
+        const n = $(id);
+        if (n) n.value = '';
+      }
+      reloadCharts();
+    });
+  }
+}
+
 syncGroups();
+syncPeriodUI();
 loadQuotes();
 setInterval(() => loadQuotes({ silent: true }), 15000);
 

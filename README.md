@@ -87,6 +87,38 @@ Key 在 <https://fuyao.aicubes.cn/admin/> 用同花顺账号登录后签发。
 - **十字光标**：鼠标在图上移动可逐根查看 OHLC 与成交量。
 - 行情每 15 秒自动刷新一次；`刷新` 按钮可立即刷新。
 
+### 分时（周期选「分时」）
+
+> ⚠️ **分时数据不是上游给的，是本服务自己采样攒出来的。** 这一点必须先清楚。
+
+上游**没有任何 A 股分钟数据**（下面是实测，不是照文档推测）：
+
+| 尝试 | 结果 |
+|---|---|
+| `high-frequency/intraday`（单日高频分时） | `code=2004` 该数据为同花顺 AI 客户端专用 |
+| `high-frequency/historical&interval=1m` | `code=2004` 同上 |
+| `prices/historical&interval=1m` | `code=1002` Invalid parameter format: interval |
+| 本地是否顺手存过 | 没有：轮询只保留最新一条报价 |
+
+而且**即便那些接口开放也没用**：它们返回的是 `hf_direction`（高频动向）与
+`hf_participation`（高频参与度）两个**指标**，**不含价格**，画不出分时图。
+
+**本服务的做法**：交易时段内每 **30 秒**取一次自选股快照，把价格与"当日累计成交量/成交额"
+按时间记录，按天写成 `data/intraday/YYYY-MM-DD.jsonl`。画出来的图与行情软件口径一致：
+
+- **价格线** + **均价线**（VWAP = 累计成交额 ÷ 累计成交量，与行情软件黄线同算法）+ **成交量柱**
+- 横轴固定铺满 `09:30–11:30 / 13:00–15:00`，**中午休市不占宽度**（图形可跨股票、跨日期直接对比）
+- 纵轴按**昨收的百分比**对称展开、0% 居中，右轴同时标百分比与对应价格
+
+**必须知道的限制**：
+
+- **不能回看采集之前的行情**：开盘前就开着服务 → 当天完整分时；下午两点才开 → 只有后半段。
+- **没有历史某天的分时**，除非那天已被采集过。已录日期用工具栏的日期选择器回放。
+- 只采**自选股**；从复盘/筛选里临时看的股票没有分时。
+- 采样间隔默认 30 秒（一天约 480 点），可用 `INTRADAY_INTERVAL_MS` 调整（下限 3000ms）。
+- 存储约 **0.5 MB/天**（12 只自选股），按天累积，不自动清理。
+- 四宫格每格的周期下拉里也有「分时」，可以和日线/周线并排看。
+
 ### 四宫格（页签「四宫格」）
 
 **同一只股票的多个周期同屏**，一眼看清大周期与小周期的关系：
@@ -282,6 +314,8 @@ PE(TTM) 区间、PB 区间。
 | POST | `/api/watchlist` | 批量添加，body `{"input": "600519 贵州茅台"}` |
 | DELETE | `/api/watchlist/:thscode` | 移除 |
 | GET | `/api/kline?thscode=&days=&adjust=&period=` | K 线；`period` = `day`/`week`/`month`/`quarter`/`year`（非日线由日线聚合）。返回 `displayStartMs`，其前的 bar 是均线预热数据 |
+| GET | `/api/intraday?thscode=&date=` | 分时（服务自采）；返回列式 `t/p/v/to/avg/m` 与 `prevClose`。`date` 省略取最新已录日期 |
+| GET | `/api/intraday/dates` | 已录制的日期清单 + 采样监控状态（间隔、轮次、错误） |
 | GET | `/api/review?date=` | 复盘面板聚合；`date` 可指定历史交易日 |
 | GET | `/api/review/dragon-tiger?board=&date=` | 龙虎榜，`board` = `all`/`org`/`hot_money` |
 | GET | `/api/screener?minPrice=&maxPe=&excludeSt=1&…` | 全市场选股筛选（成交额单位为亿） |
@@ -317,9 +351,9 @@ $env:PORT=8789; $env:DATA_DIR="$PWD\data\e2e-tmp"; node server.mjs   # 另开一
 $env:BASE='http://127.0.0.1:8789'; node scripts/e2e-test.mjs         # alert-test.mjs 同样认 BASE
 ```
 
-当前基线（合计 **165 项**，全部通过）：`chart-test` **35 项**、`ring-test` **35 项**、
-`e2e-test` **22 项**、`alert-test` **35 项**、`ma-screener-test` **15 项**、
-`screener-extra-test` **23 项**。前两个无需服务，其余需服务在跑；
+当前基线（合计 **184 项**，全部通过）：`chart-test` **49 项**（服务在跑时另有 5 项真实数据校验）、
+`ring-test` **35 项**、`e2e-test` **22 项**、`alert-test` **35 项**、
+`ma-screener-test` **15 项**、`screener-extra-test` **23 项**。前两个无需服务，其余需服务在跑；
 建议用 `DATA_DIR` 起隔离实例，避免动到真实自选股与预警。
 
 > `ring-test.mjs` 用 AudioContext 桩断言铃声结构，而不是"听一遍觉得还行"：
