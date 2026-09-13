@@ -749,11 +749,29 @@ async function refreshIntradayDates() {
       inp.min = oldest;
       inp.max = newest;
     }
+    // 采集开关与磁盘占用：自选股多的时候用户需要知道到底占多少
+    const chk = $('intraday-enabled');
+    if (chk && typeof d.enabled === 'boolean') chk.checked = d.enabled;
+    const size = $('intraday-size');
+    if (size) {
+      const n = state.intradayDates.length;
+      size.textContent = n ? `${n} 天 · ${fmtBytes(d.totalBytes ?? 0)}` : '暂无记录';
+      size.title = '已采集的天数与占用（历史天会自动 gzip 压缩）';
+    }
     return state.intradayDates;
   } catch {
     state.intradayDates = [];
     return [];
   }
+}
+
+/** 字节数转成人看的单位 */
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 /** 分时模式下：区间/复权按钮无意义，换成日期选择器 */
@@ -1950,6 +1968,24 @@ for (const [inpId, btnId] of [['intraday-date', 'intraday-latest'], ['quad-intra
     });
   }
 }
+
+// 采集开关：关掉后不再采样（已有记录仍可回放）
+$('intraday-enabled')?.addEventListener('change', async (e) => {
+  const enabled = e.target.checked;
+  try {
+    const r = await fetch('/api/intraday/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    const d = await r.json();
+    if (typeof d.enabled === 'boolean') e.target.checked = d.enabled;
+    await refreshIntradayDates();
+  } catch (err) {
+    console.error('切换采集开关失败', err);
+    e.target.checked = !enabled; // 失败就还原，别让界面显示成已生效
+  }
+});
 
 syncGroups();
 syncPeriodUI();

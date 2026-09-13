@@ -629,3 +629,48 @@ table.rv button.mini.danger:hover { color: var(--up); border-color: var(--up); }
   from { opacity: 0; transform: translateX(16px); }
   to { opacity: 1; transform: none; }
 }
+
+/* ---------------------------------------------------------------- 分时工具栏 */
+
+/* 工具栏里的日期输入与采集开关 */
+.group input[type="date"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 0;
+  padding: 4px 6px;
+  font-size: 12px;
+  font-family: inherit;
+}
+.group input[type="date"]:focus { outline: none; }
+.group #intraday-latest,
+.group #quad-intraday-latest {
+  background: var(--panel);
+  color: var(--muted);
+  border: 0;
+  border-left: 1px solid var(--line);
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.group #intraday-latest:hover,
+.group #quad-intraday-latest:hover { color: var(--text); }
+
+label.chk.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+label.chk.inline input { flex: none; }
+label.chk.inline:hover { color: var(--text); }
+
+#intraday-size {
+  padding: 0 8px 0 2px;
+  font-size: 11px;
+  white-space: nowrap;
+}

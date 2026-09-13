@@ -116,7 +116,17 @@ Key 在 <https://fuyao.aicubes.cn/admin/> 用同花顺账号登录后签发。
 - **没有历史某天的分时**，除非那天已被采集过。已录日期用工具栏的日期选择器回放。
 - 只采**自选股**；从复盘/筛选里临时看的股票没有分时。
 - 采样间隔默认 30 秒（一天约 480 点），可用 `INTRADAY_INTERVAL_MS` 调整（下限 3000ms）。
-- 存储约 **0.5 MB/天**（12 只自选股），按天累积，不自动清理。
+- **占空间很小**：历史天会在启动时/跨天时自动 **gzip**（实测 **8.5 倍**，一把 12 只 × 480 点的
+  样本从 231 KB 压到 27 KB），只有"今天"的文件保持明文以便继续追加。按 242 个交易日算：
+
+  | 自选股 | 压缩后占用 |
+  |---|---|
+  | 12 只 | 约 **6.5 MB/年** |
+  | 50 只 | 约 **27 MB/年** |
+  | 100 只 | 约 **54 MB/年** |
+
+- **可以随时关掉采集**：工具栏分时那一行有「采集」勾选框，关掉后不再采样，
+  **已有记录仍可回放**；旁边直接显示「N 天 · 占用多少」。
 - 四宫格每格的周期下拉里也有「分时」，可以和日线/周线并排看。
 
 ### 四宫格（页签「四宫格」）
@@ -296,6 +306,7 @@ PE(TTM) 区间、PB 区间。
 | `scripts/smoke.mjs` | 冒烟测试：7 项探针验证 Key 与链路 |
 | `scripts/chart-test.mjs` | 图表组件测试（**无需浏览器**）：缩放数学、各图独立、异常输入 |
 | `scripts/ma-screener-test.mjs` | 均线选股测试（**需服务在跑**）：与 K 线接口交叉验证 MA 偏离、排列、覆盖率上报 |
+| `scripts/intraday-test.mjs` | 分时采集测试（**需服务在跑**）：meta 去重、gzip 历史天仍可读、采集开关 |
 | `scripts/screener-extra-test.mjs` | 新增筛选条件测试（**需服务在跑**）：行情派生值交叉验证、涨停/龙虎榜/热榜与复盘接口互核、金叉筛选 |
 | `scripts/alert-test.mjs` | 价格预警端到端测试（**需服务在跑**）：触发链路 + 前端接线一致性 |
 | `scripts/e2e-test.mjs` | 端到端测试：**22 项**，覆盖增删、解析、复权语义、复盘、筛选、回测、错误处理 |
@@ -315,7 +326,8 @@ PE(TTM) 区间、PB 区间。
 | DELETE | `/api/watchlist/:thscode` | 移除 |
 | GET | `/api/kline?thscode=&days=&adjust=&period=` | K 线；`period` = `day`/`week`/`month`/`quarter`/`year`（非日线由日线聚合）。返回 `displayStartMs`，其前的 bar 是均线预热数据 |
 | GET | `/api/intraday?thscode=&date=` | 分时（服务自采）；返回列式 `t/p/v/to/avg/m` 与 `prevClose`。`date` 省略取最新已录日期 |
-| GET | `/api/intraday/dates` | 已录制的日期清单 + 采样监控状态（间隔、轮次、错误） |
+| GET | `/api/intraday/dates` | 已录制的日期清单 + 采集开关状态 + 总占用 + 采样监控 |
+| POST | `/api/intraday/config` | 开关采集：body `{"enabled": true|false}` |
 | GET | `/api/review?date=` | 复盘面板聚合；`date` 可指定历史交易日 |
 | GET | `/api/review/dragon-tiger?board=&date=` | 龙虎榜，`board` = `all`/`org`/`hot_money` |
 | GET | `/api/screener?minPrice=&maxPe=&excludeSt=1&…` | 全市场选股筛选（成交额单位为亿） |
@@ -340,6 +352,7 @@ node scripts/ring-test.mjs  # 预警铃声：响几遍/间隔/静音（无需服
 node scripts/alert-test.mjs # 价格预警端到端（需服务在跑；自建自删测试预警，不碰你已有的）
 node scripts/ma-screener-test.mjs # 均线选股（需服务在跑；只读，不改数据）
 node scripts/screener-extra-test.mjs # 新增筛选条件（需服务在跑；只读，不改数据）
+node scripts/intraday-test.mjs   # 分时采集（需服务在跑；会在分时目录写一个测试文件并清理）
 node scripts/e2e-test.mjs   # 端到端（需服务在跑；会清空自选股）
 ```
 
@@ -351,10 +364,10 @@ $env:PORT=8789; $env:DATA_DIR="$PWD\data\e2e-tmp"; node server.mjs   # 另开一
 $env:BASE='http://127.0.0.1:8789'; node scripts/e2e-test.mjs         # alert-test.mjs 同样认 BASE
 ```
 
-当前基线（合计 **184 项**，全部通过）：`chart-test` **49 项**（服务在跑时另有 5 项真实数据校验）、
+当前基线（合计 **206 项**，全部通过）：`chart-test` **49 项**（服务在跑时另有 5 项真实数据校验）、
 `ring-test` **35 项**、`e2e-test` **22 项**、`alert-test` **35 项**、
-`ma-screener-test` **15 项**、`screener-extra-test` **23 项**。前两个无需服务，其余需服务在跑；
-建议用 `DATA_DIR` 起隔离实例，避免动到真实自选股与预警。
+`ma-screener-test` **15 项**、`screener-extra-test` **23 项**、`intraday-test` **22 项**。
+前两个无需服务，其余需服务在跑；建议用 `DATA_DIR` 起隔离实例，避免动到真实自选股与预警。
 
 > `ring-test.mjs` 用 AudioContext 桩断言铃声结构，而不是"听一遍觉得还行"：
 > 默认确实排了 **3 遍 × 3 音 × 3 泛音 = 27 个振荡器**，三遍起点等距（0 / 1.54 / 3.08 秒），

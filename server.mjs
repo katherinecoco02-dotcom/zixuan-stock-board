@@ -11,7 +11,8 @@
  */
 
 import { createServer } from 'node:http';
-import { readFile, writeFile, mkdir, appendFile, readdir, stat } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, appendFile, readdir, stat, unlink } from 'node:fs/promises';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -517,7 +518,30 @@ function startAlertMonitor() {
  * 采样间隔默认 30 秒（一天约 480 点，够画分时），可用 INTRADAY_INTERVAL_MS 调整。
  */
 const INTRADAY_DIR = path.join(DATA_DIR, 'intraday');
+const INTRADAY_CONFIG_FILE = path.join(DATA_DIR, 'intraday-config.json');
 const INTRADAY_INTERVAL_MS = Math.max(Number(process.env.INTRADAY_INTERVAL_MS ?? 30_000) || 30_000, 3_000);
+
+/**
+ * 采集开关。storage 会随自选股数量线性增长，所以要能一键停。
+ * 过去的日子在收盘后会自动 gzip（约 8~10 倍压缩），所以长期占用很小。
+ */
+let intradayConfig = { enabled: true };
+
+async function loadIntradayConfig() {
+  try {
+    const j = JSON.parse(await readFile(INTRADAY_CONFIG_FILE, 'utf8'));
+    if (typeof j?.enabled === 'boolean') intradayConfig.enabled = j.enabled;
+  } catch {
+    /* 没有配置文件就用默认值 */
+  }
+  if (process.env.INTRADAY_ENABLED === '0') intradayConfig.enabled = false;
+  return intradayConfig;
+}
+
+async function saveIntradayConfig() {
+  await mkdir(DATA_DIR, { recursive: true });
+  await writeFile(INTRADAY_CONFIG_FILE, JSON.stringify(intradayConfig, null, 2), 'utf8');
+}
 
 const intradayMonitor = {
   intervalMs: INTRADAY_INTERVAL_MS,
@@ -527,8 +551,11 @@ const intradayMonitor = {
   samples: 0,
   ticks: 0,
   skippedClosed: 0,
+  skippedDisabled: 0,
   errors: 0,
   lastError: null,
+  compressed: 0,        // 已压缩的历史天数
+  lastMetaJson: null,   // 上次写过的 meta 行内容，相同就不再写（省掉约 25% 体积）
 };
 
 /** 上海时区的 YYYY-MM-DD */
@@ -558,6 +585,10 @@ let intradayTimer = null;
 
 async function intradayTick() {
   const forced = process.env.INTRADAY_FORCE_SESSION === '1';
+  if (!intradayConfig.enabled) {
+    intradayMonitor.skippedDisabled += 1;
+    return;
+  }
   const session = await marketSession();
   if (!session.open && !forced) {
     intradayMonitor.skippedClosed += 1;
@@ -592,13 +623,23 @@ async function intradayTick() {
   const line = JSON.stringify({ t: Math.floor(now / 1000), q: quotes }) + '\n';
   await appendFile(intradayFile(date), line, 'utf8');
 
-  // meta 每次都补一行（读取端取最后一条），这样盘中新加的自选股也能有昨收
+  // meta 行（昨收）只在内容变化时补写：原来每个采样点都写一遍，白占约 25% 体积。
+  // 内容一变就写，所以盘中新加的自选股照样能拿到昨收。
   const metaLine = JSON.stringify({ meta: true, date, prevClose }) + '\n';
-  await appendFile(intradayFile(date), metaLine, 'utf8');
+  if (metaLine !== intradayMonitor.lastMetaJson) {
+    await appendFile(intradayFile(date), metaLine, 'utf8');
+    intradayMonitor.lastMetaJson = metaLine;
+  }
 
   intradayMonitor.samples += Object.keys(quotes).length;
   intradayMonitor.ticks += 1;
   intradayMonitor.lastSampleAt = new Date().toISOString();
+
+  // 每天第一次采样后（或跨天启动）把历史天压缩掉，避免明文无限堆积
+  if (intradayMonitor.lastCompressDay !== date) {
+    intradayMonitor.lastCompressDay = date;
+    await compressOldIntradayDays();
+  }
 }
 
 function startIntradayRecorder() {
@@ -621,14 +662,18 @@ function startIntradayRecorder() {
   console.log(`[intraday] 分时采样已启动，间隔 ${INTRADAY_INTERVAL_MS / 1000} 秒（仅交易时段采集自选股，按天存 data/intraday/）`);
 }
 
-/** 读某天的分时：返回 { date, prevClose, series: { code: {t[],p[],v[],to[]} } } */
+/** 读某天的分时：返回 { date, prevClose, series: { code: {t[],p[],v[],to[]} } }
+ *  明文（今天）与 gzip（历史）两种都能读。 */
 async function loadIntradayDay(date) {
-  const file = intradayFile(date);
   let text = null;
   try {
-    text = await readFile(file, 'utf8');
+    text = await readFile(intradayFile(date), 'utf8');
   } catch {
-    return null;
+    try {
+      text = gunzipSync(await readFile(`${intradayFile(date)}.gz`)).toString('utf8');
+    } catch {
+      return null;
+    }
   }
   const prevClose = {};
   const series = {};
@@ -666,19 +711,59 @@ async function listIntradayDates() {
   } catch {
     return [];
   }
-  const out = [];
+  const byDate = new Map();
   for (const n of names) {
-    const m = n.match(/^(\d{4}-\d{2}-\d{2})\.jsonl$/);
+    const m = n.match(/^(\d{4}-\d{2}-\d{2})\.jsonl(\.gz)?$/);
     if (!m) continue;
+    const date = m[1];
+    const gz = Boolean(m[2]);
     const file = path.join(INTRADAY_DIR, n);
     let bytes = 0;
     try {
       bytes = (await stat(file)).size;
     } catch { /* ignore */ }
-    out.push({ date: m[1], bytes, file });
+    // 同一天同时存在 .jsonl 与 .jsonl.gz 时优先取压缩版（压缩完会删原文件）
+    const prev = byDate.get(date);
+    if (prev && !prev.gz && gz) byDate.set(date, { date, bytes, gz, file });
+    else if (!prev) byDate.set(date, { date, bytes, gz, file });
   }
+  const out = [...byDate.values()];
   out.sort((a, b) => b.date.localeCompare(a.date));
   return out;
+}
+
+/**
+ * 把"今天以前"的明文分时文件压缩成 .gz（JSONL 重复键多、数字相近，实测约 8~10 倍），
+ * 压缩成功后删掉原文件。今天的文件保持明文以便继续追加。
+ * 每天只需要跑一次。
+ */
+async function compressOldIntradayDays() {
+  const today = shDate();
+  let names = [];
+  try {
+    names = await readdir(INTRADAY_DIR);
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  for (const name of names) {
+    const m = name.match(/^(\d{4}-\d{2}-\d{2})\.jsonl$/);
+    if (!m || m[1] >= today) continue; // 字符串比较对 ISO 日期有效
+    const src = path.join(INTRADAY_DIR, name);
+    try {
+      const raw = await readFile(src);
+      await writeFile(`${src}.gz`, gzipSync(raw, { level: 9 }));
+      await unlink(src);
+      n += 1;
+    } catch (err) {
+      console.error(`[intraday] 压缩 ${name} 失败：${err.message}`);
+    }
+  }
+  if (n) {
+    intradayMonitor.compressed += n;
+    console.log(`[intraday] 已压缩 ${n} 个历史分时文件（省下约 8~10 倍体积）`);
+  }
+  return n;
 }
 
 /** 一条预警的实时对照：现价、是否已满足、距离目标还差多少（>0 表示还没到）。 */
@@ -1824,8 +1909,11 @@ const server = createServer(async (req, res) => {
     // 上游没有 A 股分钟数据，所以分时图的数据是服务自己按时采样的结果，按天存盘。
     if (p === '/api/intraday/dates' && req.method === 'GET') {
       const dates = await listIntradayDates();
+      const totalBytes = dates.reduce((s, d) => s + (d.bytes || 0), 0);
       return sendJson(res, 200, {
-        dates: dates.map((d) => ({ date: d.date, bytes: d.bytes })),
+        dates: dates.map((d) => ({ date: d.date, bytes: d.bytes, gz: d.gz })),
+        totalBytes,
+        enabled: intradayConfig.enabled,
         intervalSec: INTRADAY_INTERVAL_MS / 1000,
         monitor: {
           startedAt: intradayMonitor.startedAt,
@@ -1833,10 +1921,28 @@ const server = createServer(async (req, res) => {
           ticks: intradayMonitor.ticks,
           samples: intradayMonitor.samples,
           skippedClosed: intradayMonitor.skippedClosed,
+          skippedDisabled: intradayMonitor.skippedDisabled,
+          compressed: intradayMonitor.compressed,
           errors: intradayMonitor.errors,
           lastError: intradayMonitor.lastError,
         },
         dir: INTRADAY_DIR,
+      });
+    }
+
+    // 采集开关：自选股多、不想占盘时可以关掉
+    if (p === '/api/intraday/config' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      if (typeof body.enabled === 'boolean') {
+        intradayConfig.enabled = body.enabled;
+        await saveIntradayConfig();
+        console.log(`[intraday] 采集已${intradayConfig.enabled ? '开启' : '关闭'}`);
+      }
+      const dates = await listIntradayDates();
+      return sendJson(res, 200, {
+        enabled: intradayConfig.enabled,
+        totalBytes: dates.reduce((s, d) => s + (d.bytes || 0), 0),
+        dateCount: dates.length,
       });
     }
 
@@ -1896,12 +2002,15 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
+server.listen(PORT, HOST, async () => {
   console.log(`自选股看板已启动： http://${HOST}:${PORT}`);
   console.log(`Key 来源： ${client.keySource}`);
   console.log(`自选股文件： ${WATCHLIST_FILE}`);
   console.log(`预警文件： ${ALERTS_FILE}`);
   console.log(`分时目录： ${INTRADAY_DIR}`);
   startAlertMonitor();
+  await loadIntradayConfig();
+  await compressOldIntradayDays(); // 启动时顺手把历史分时压缩掉
+  intradayMonitor.lastCompressDay = shDate();
   startIntradayRecorder();
 });

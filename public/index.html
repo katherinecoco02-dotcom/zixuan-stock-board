@@ -328,6 +328,10 @@
       <div class="group" id="intraday-date-group" hidden>
         <input type="date" id="intraday-date" title="回放已录制的分时（只列已采集的日期）">
         <button id="intraday-latest">最新</button>
+        <label class="chk inline" title="关掉后不再采样，已有记录仍可回放">
+          <input type="checkbox" id="intraday-enabled" checked> 采集
+        </label>
+        <span id="intraday-size" class="dim"></span>
       </div>
       <div class="spacer"></div>
       <div id="chart-info" class="chart-info">—</div>
