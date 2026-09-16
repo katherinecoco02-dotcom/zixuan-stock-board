@@ -32,6 +32,7 @@ function makeCanvas(w = 800, h = 400) {
   return {
     width: 0,
     height: 0,
+    style: {},                    // 真实 canvas 一定有 style，画笔要靠它改 cursor
     getContext: () => ctxStub,
     addEventListener: (type, fn) => { listeners[type] = fn; },
     getBoundingClientRect: () => ({ left: 0, top: 0, width: w, height: h }),
@@ -304,6 +305,104 @@ noPc.setIntraday({
 });
 const infN = noPc.infoAt(1);
 ok(Number.isFinite(infN.dev), `昨收缺失时基准回退到首价，偏离 = ${infN.dev.toFixed(2)}%`);
+
+console.log('\n=== 18) 画笔：坐标映射往返一致 ===');
+const canvasP = makeCanvas(900, 420);
+const chartP = new KlineChart(canvasP, {});
+chartP.setData({ items, displayStartMs, period: 'day' });
+const gP = chartP._geomCache;
+
+const iMid = Math.floor(gP.n / 2);
+const dMid = gP.view[iMid].date_ms;
+const xMid = chartP._xOfDate(dMid);
+ok(Math.abs(xMid - gP.x(iMid)) < 0.01,
+  `bar 日期 → x 落在该根中心（${xMid.toFixed(1)} vs ${gP.x(iMid).toFixed(1)}）`);
+ok(chartP._dateAtX(xMid) === dMid, 'x → 日期 往返一致（吸附回同一根）');
+
+const dA = gP.view[iMid].date_ms;
+const dB = gP.view[iMid + 1].date_ms;
+const xBetween = chartP._xOfDate((dA + dB) / 2);
+ok(xBetween > gP.x(iMid) && xBetween < gP.x(iMid + 1),
+  `两根之间按时间插值（${xBetween.toFixed(1)} 落在 ${gP.x(iMid).toFixed(1)}~${gP.x(iMid + 1).toFixed(1)}）`);
+
+const priceMid = (gP.lo + gP.hi) / 2;
+const yMid = chartP._yOfPrice(priceMid);
+ok(Math.abs(yMid - (gP.priceTop + gP.priceBot) / 2) < 0.5, `中位价 → 绘图区中央（${yMid.toFixed(1)}）`);
+ok(Math.abs(chartP._priceAtY(yMid) - priceMid) < 1e-6, 'y → 价格 往返一致');
+
+console.log('\n=== 19) 画笔：画一条直线 ===');
+chartP.setDrawTool('line');
+chartP.setDrawStyle({ color: '#e5484d', width: 3 });
+const y1 = chartP._yOfPrice(gP.lo + (gP.hi - gP.lo) * 0.3);
+const y2 = chartP._yOfPrice(gP.lo + (gP.hi - gP.lo) * 0.7);
+chartP._onDown({ clientX: gP.x(10), clientY: y1 });
+ok(chartP._drawing === true && chartP._draft?.points.length === 2, '按下后生成两点草稿');
+chartP._onMove({ clientX: gP.x(60), clientY: y2 });
+ok(chartP._draft.points[1].date_ms === chartP._dateAtX(gP.x(60)), '拖动时更新终点');
+chartP._onUp();
+ok(chartP.annotations.length === 1, `抬起后落成 1 条画记（${chartP.annotations.length}）`);
+ok(chartP.annotations[0].color === '#e5484d' && chartP.annotations[0].width === 3, '颜色与粗细被记下');
+ok(chartP.annotations[0].points.every((p) => p.price > 0 && p.date_ms > 0), '存的是数据坐标（日期+价格）');
+
+console.log('\n=== 20) 画笔：橡皮擦命中判定 ===');
+const pts0 = chartP._annotationPts(chartP.annotations[0]);
+const mp = { x: (pts0[0].x + pts0[1].x) / 2, y: (pts0[0].y + pts0[1].y) / 2 };
+ok(chartP._hitAnnotation(mp.x, mp.y + 3) === 0, '线附近 3px 命中');
+ok(chartP._hitAnnotation(mp.x, mp.y + 60) === -1, '线外 60px 不命中');
+chartP.setDrawTool('erase');
+chartP._onDown({ clientX: mp.x, clientY: mp.y });
+ok(chartP.annotations.length === 0, '橡皮点中后画记被删除');
+
+console.log('\n=== 21) 画笔：自由曲线按像素抽点 ===');
+chartP.setDrawTool('free');
+const fx = gP.x(10);
+const fy = chartP._yOfPrice(gP.lo + (gP.hi - gP.lo) * 0.5);
+chartP._onDown({ clientX: fx, clientY: fy });
+for (let k = 0; k < 50; k++) chartP._onMove({ clientX: fx, clientY: fy }); // 原地不动 50 次
+ok(chartP._draft.points.length === 1, `原地重复事件不增点（${chartP._draft.points.length} 个点）`);
+for (let k = 1; k <= 60; k++) chartP._onMove({ clientX: fx + k * 3, clientY: fy + Math.sin(k / 6) * 25 });
+chartP._onUp();
+const freeAnn = chartP.annotations[0];
+ok(freeAnn?.tool === 'free' && freeAnn.points.length > 5,
+  `自由曲线落成一条，抽到 ${freeAnn.points.length} 个点`);
+ok(freeAnn.points.length < 61, '点数少于事件数（抽稀生效）');
+
+console.log('\n=== 22) 画笔：换窗口后仍按数据坐标定位 ===');
+chartP.setDrawTool('line');
+chartP._onDown({ clientX: gP.x(20), clientY: y1 });
+chartP._onMove({ clientX: gP.x(40), clientY: y2 });
+chartP._onUp();
+const ann2 = chartP.annotations[chartP.annotations.length - 1];
+const snapPts = JSON.stringify(ann2.points);
+const xBefore = chartP._xOfDate(ann2.points[0].date_ms);
+chartP.setData({ items, displayStartMs: items[150].date_ms, period: 'day' }); // 换成只看后半段
+const xAfter = chartP._xOfDate(ann2.points[0].date_ms);
+ok(JSON.stringify(chartP.annotations[chartP.annotations.length - 1].points) === snapPts,
+  '换窗口后画记的数据坐标没有被改写');
+ok(Math.abs(xAfter - xBefore) > 1,
+  `同一日期在新窗口里的 x 随之改变（${xBefore.toFixed(0)} → ${xAfter.toFixed(0)}），证明是按数据定位`);
+
+console.log('\n=== 23) 画笔：缩放守卫与一键清除 ===');
+const zoomBefore = chartP.visibleCount();
+chartP._onWheel({ deltaY: -100, clientX: 400, preventDefault() {} });
+ok(chartP.visibleCount() === zoomBefore, '画笔开启时滚轮不缩放');
+chartP.setDrawTool(null);
+chartP._onWheel({ deltaY: -100, clientX: 400, preventDefault() {} });
+ok(chartP.visibleCount() < zoomBefore, `关闭画笔后滚轮恢复缩放（${zoomBefore} → ${chartP.visibleCount()}）`);
+
+const nClear = chartP.clearAnnotations();
+ok(nClear >= 1 && chartP.annotations.length === 0, `一键清除清掉 ${nClear} 条`);
+ok(chartP._draft === null, '清除时草稿也一并丢弃');
+
+console.log('\n=== 24) 画笔：无数据时不崩 ===');
+const bare = new KlineChart(makeCanvas(900, 420), {});
+bare.setDrawTool('line');
+bare._onDown({ clientX: 100, clientY: 100 });
+bare._onMove({ clientX: 200, clientY: 200 });
+bare._onUp();
+ok(bare.annotations.length === 0, '无数据时画笔操作安全返回，不产生画记');
+bare.setAnnotations(null);
+ok(Array.isArray(bare.annotations) && bare.annotations.length === 0, 'setAnnotations(null) 归一成空数组');
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项。`);
 process.exit(fail > 0 ? 1 : 0);

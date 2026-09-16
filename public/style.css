@@ -674,3 +674,33 @@ label.chk.inline:hover { color: var(--text); }
   font-size: 11px;
   white-space: nowrap;
 }
+
+/* ---------------------------------------------------------------- 画笔 */
+
+.draw-bar { padding-top: 3px; }
+
+#draw-toggle.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* 色块按钮：用 --c 作为填充色。选择器比 .group button.active 更具体，
+   否则激活态会被主题色盖掉，看不出选了哪个颜色 */
+.toolbar .group button.swatch {
+  width: 20px;
+  height: 15px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--c, #888);
+  cursor: pointer;
+}
+.toolbar .group button.swatch:hover { border-color: var(--text); }
+.toolbar .group button.swatch.active {
+  background: var(--c, #888);
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+
+.draw-bar .chart-info { font-size: 11px; }

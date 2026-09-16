@@ -333,8 +333,41 @@
         </label>
         <span id="intraday-size" class="dim"></span>
       </div>
+      <div class="group">
+        <button id="draw-toggle" title="开启画笔后可画线；开启期间滚轮缩放与双击复位会关闭">✏ 画笔</button>
+      </div>
       <div class="spacer"></div>
       <div id="chart-info" class="chart-info">—</div>
+    </div>
+
+    <!-- 画笔工具条：只在开启画笔后出现 -->
+    <div class="toolbar draw-bar" id="draw-bar" hidden>
+      <div class="group" id="draw-tools">
+        <button data-tool="line" class="active" title="直线">╱ 直线</button>
+        <button data-tool="arrow" title="箭头">↗ 箭头</button>
+        <button data-tool="free" title="自由曲线">✎ 曲线</button>
+        <button data-tool="rect" title="方框">▭ 方框</button>
+        <button data-tool="erase" title="橡皮擦：点中画记即删除">⌫ 橡皮</button>
+      </div>
+      <div class="group" id="draw-colors">
+        <button data-color="#e5484d" class="swatch" style="--c:#e5484d" title="红"></button>
+        <button data-color="#e8b339" class="swatch active" style="--c:#e8b339" title="黄"></button>
+        <button data-color="#26a269" class="swatch" style="--c:#26a269" title="绿"></button>
+        <button data-color="#4c8dff" class="swatch" style="--c:#4c8dff" title="蓝"></button>
+        <button data-color="#c678dd" class="swatch" style="--c:#c678dd" title="紫"></button>
+        <button data-color="#d7dee8" class="swatch" style="--c:#d7dee8" title="白"></button>
+      </div>
+      <div class="group" id="draw-widths">
+        <button data-width="1">细</button>
+        <button data-width="2" class="active">中</button>
+        <button data-width="4">粗</button>
+      </div>
+      <div class="group">
+        <button id="draw-undo" title="撤销最后一条">↶ 撤销</button>
+        <button id="draw-clear" title="清空当前股票的全部画记">🗑 一键清除</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="chart-info dim" id="draw-hint">按住拖动画；橡皮点中即删。画记只存在本页内存里，刷新会清空。</div>
     </div>
 
     <div id="chart-wrap">

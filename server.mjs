@@ -1366,9 +1366,12 @@ const server = createServer(async (req, res) => {
 
       const fetchPanels = (dateMs) =>
         Promise.all([
-          safe('limitUp', () => client.limitUpPool({ dateMs, size: 60 })),
-          safe('limitDown', () => client.get('/api/a-share/special-data/limit-down-pool', { date_ms: dateMs, size: 30 })),
-          safe('limitBreak', () => client.get('/api/a-share/special-data/limit-break-pool', { date_ms: dateMs, size: 30 })),
+          // 三个池子统一取 200（上游单页上限）。原先 60/30/30 与选股器取的 200 不一致，
+          // 池子一大就会出现"复盘说 30 家、选股器却筛出池外的票"这种自相矛盾；
+          // 而且界面上的家数直接用了 items.length，等于一直在少报。
+          safe('limitUp', () => client.limitUpPool({ dateMs, size: 200 })),
+          safe('limitDown', () => client.get('/api/a-share/special-data/limit-down-pool', { date_ms: dateMs, size: 200 })),
+          safe('limitBreak', () => client.get('/api/a-share/special-data/limit-break-pool', { date_ms: dateMs, size: 200 })),
           safe('ladder', () => client.limitUpLadder()),
           safe('hot', () => client.hotStockList({ period: 'day' })),
           safe('skyrocket', () => client.get('/api/a-share/special-data/skyrocket-list', { period: 'day' })),
@@ -1403,7 +1406,9 @@ const server = createServer(async (req, res) => {
           limitUp: limitUp?.item ?? [],
           limitUpTotal: limitUp?.pagination?.total ?? null,
           limitDown: limitDown?.item ?? [],
+          limitDownTotal: limitDown?.pagination?.total ?? null,
           limitBreak: limitBreak?.item ?? [],
+          limitBreakTotal: limitBreak?.pagination?.total ?? null,
           ladder: latestLadder,
           ladderDays: ladderDays.map((d) => d.date),
           hot: hot?.item ?? [],

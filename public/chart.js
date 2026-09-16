@@ -49,6 +49,36 @@
     return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
   }
 
+  /** 毫秒时间戳 → 盘中第几分钟（与服务端 sessionMinuteOf 同口径，分时画笔定位要用） */
+  function sessionMinuteFromMs(ms) {
+    const d = new Date(ms + 8 * 3600 * 1000);
+    const m = d.getUTCHours() * 60 + d.getUTCMinutes();
+    if (m < 9 * 60 + 30) return 0;
+    if (m <= 11 * 60 + 30) return m - (9 * 60 + 30);
+    if (m < 13 * 60) return 120;
+    return 120 + Math.min(120, m - 13 * 60);
+  }
+
+  /** 点到线段的最短距离（橡皮擦命中判定） */
+  function distToSeg(px, py, ax, ay, bx, by) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) return Math.hypot(px - ax, py - ay);
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+  }
+
+  /** 自由曲线抽稀：等间隔取点并保留首尾 */
+  function downsample(points, max) {
+    if (points.length <= max) return points;
+    const out = [];
+    const stepF = (points.length - 1) / (max - 1);
+    for (let i = 0; i < max; i++) out.push(points[Math.round(i * stepF)]);
+    return out;
+  }
+
   /** 简单移动平均；前 period-1 根为 null。 */
   function computeMA(items, period) {
     const out = new Array(items.length).fill(null);
@@ -80,12 +110,21 @@
       // 分时模式：数据是服务端自己按时采样的（上游没有 A 股分钟线）
       this.mode = 'kline';     // 'kline' | 'intraday'
       this.intraday = null;
+      // 画笔（纯前端内存，不落盘：按需求不做持久化）
+      this.annotations = [];
+      this.drawTool = null;    // null | 'line' | 'arrow' | 'free' | 'rect' | 'erase'
+      this.drawColor = '#e8b339';
+      this.drawWidth = 2;
+      this._draft = null;      // 正在画的那条
+      this._drawing = false;
 
       canvas.addEventListener('mousemove', (e) => this._onMove(e));
       canvas.addEventListener('mouseleave', () => this._onLeave());
+      canvas.addEventListener('mousedown', (e) => this._onDown(e));
+      canvas.addEventListener('mouseup', (e) => this._onUp(e));
       // passive:false 才能 preventDefault，避免滚轮顺带滚动页面
       canvas.addEventListener('wheel', (e) => this._onWheel(e), { passive: false });
-      canvas.addEventListener('dblclick', () => this.resetZoom());
+      canvas.addEventListener('dblclick', () => { if (!this.drawTool) this.resetZoom(); });
     }
 
     /** 显示窗口（按 displayStartMs 切好）在完整序列中的起点下标 */
@@ -145,6 +184,7 @@
     _onWheel(e) {
       const g = this._geomCache;
       if (!g || !g.baseLength) return;
+      if (this.drawTool) return; // 画笔开启时不缩放：免得画到一半图自己动了
       e.preventDefault();
 
       const total = g.baseLength;
@@ -203,8 +243,31 @@
     _onMove(e) {
       const g = this._geomCache;
       if (!g || !g.n) return;
-      const rect = this.canvas.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
+      const { x: mx, y: my } = this._localXY(e);
+
+      // 正在画：把当前点并进草稿，此时不更新悬停信息
+      if (this._drawing && this._draft) {
+        const pt = { date_ms: this._dateAtX(mx), price: this._priceAtY(my) };
+        if (Number.isFinite(pt.date_ms) && Number.isFinite(pt.price) && pt.price > 0) {
+          const d = this._draft;
+          if (d.tool === 'free') {
+            const prev = d.points[d.points.length - 1];
+            const px = this._xOfDate(prev.date_ms);
+            const py = this._yOfPrice(prev.price);
+            const cx = this._xOfDate(pt.date_ms);
+            const cy = this._yOfPrice(pt.price);
+            // 按**像素**距离抽点：只比时间会把垂直方向的笔画整个丢掉
+            if (Number.isFinite(px) && Math.hypot(cx - px, cy - py) >= 2 && d.points.length < 600) {
+              d.points.push(pt);
+            }
+          } else {
+            d.points[d.points.length - 1] = pt;
+          }
+          this.draw();
+        }
+        return;
+      }
+
       let i;
       if (g.intraday) {
         // 分时的点按时间摆放、间距不等，必须找最近的点而不是按等距下标算
@@ -337,7 +400,7 @@
         const m = d.m?.[i];
         xs[i] = xOf(m === undefined ? (n === 1 ? 240 : (i / (n - 1)) * 240) : m);
       }
-      this._geomCache = { intraday: true, n, xs, padL, padR, priceTop, priceBot, volTop, volBot };
+      this._geomCache = { intraday: true, n, xs, padL, padR, priceTop, priceBot, volTop, volBot, pc, maxAbs };
 
       // ---- 右轴底色
       ctx.fillStyle = '#0f1621';
@@ -460,6 +523,9 @@
         }
       }
 
+      // ---- 画笔画记（画在图形之上、十字光标之下）
+      this._renderAnnotations(ctx);
+
       // ---- 十字光标
       if (this.hoverIndex !== null && this.hoverIndex < n) {
         const i = this.hoverIndex;
@@ -483,6 +549,270 @@
         ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
         ctx.fill();
       }
+    }
+
+    // ---------------------------------------------------------------- 画笔
+    // 设计要点：画记存的是**数据坐标**（date_ms + price），不是像素坐标。
+    // 否则一缩放、换周期、改窗口大小，画的东西就全错位了。
+    // 纯前端内存，不落盘（按需求不做持久化）。
+
+    /** 换股票时把该股的画记交给图（由外部按股票暂存） */
+    setAnnotations(list) {
+      this.annotations = Array.isArray(list) ? list : [];
+      this._draft = null;
+      this._drawing = false;
+      this.draw();
+    }
+
+    /** 切换画笔工具；传 null 关闭画笔 */
+    setDrawTool(tool) {
+      this.drawTool = tool || null;
+      this._draft = null;
+      this._drawing = false;
+      this.canvas.style.cursor = this.drawTool ? 'crosshair' : '';
+      this.draw();
+    }
+
+    setDrawStyle({ color, width } = {}) {
+      if (color) this.drawColor = color;
+      if (width) this.drawWidth = width;
+    }
+
+    /** 日期 → 屏幕 x（K 线在相邻两根之间按时间插值；分时取最近采样点） */
+    _xOfDate(ms) {
+      const g = this._geomCache;
+      if (!g) return NaN;
+      const w = this.canvas.parentElement.clientWidth;
+
+      if (g.intraday) {
+        const d = this.intraday;
+        if (!d?.t?.length || !g.xs) return NaN;
+        const sec = ms / 1000;
+        let bi = 0;
+        let bd = Infinity;
+        for (let i = 0; i < d.t.length; i++) {
+          const dd = Math.abs(d.t[i] - sec);
+          if (dd < bd) { bd = dd; bi = i; }
+        }
+        return g.xs[bi];
+      }
+
+      const view = g.view;
+      if (!view?.length) return NaN;
+      const xOf = (i) => g.padL + (i + 0.5) * g.step;
+      if (ms <= view[0].date_ms) return xOf(0);
+      const last = view.length - 1;
+      if (ms >= view[last].date_ms) return xOf(last);
+      let lo = 0;
+      let hi = last;
+      while (lo < hi - 1) {
+        const mid = (lo + hi) >> 1;
+        if (view[mid].date_ms <= ms) lo = mid; else hi = mid;
+      }
+      const t0 = view[lo].date_ms;
+      const t1 = view[hi].date_ms;
+      const f = t1 > t0 ? (ms - t0) / (t1 - t0) : 0;
+      return xOf(lo) + (xOf(hi) - xOf(lo)) * f;
+    }
+
+    /** 屏幕 x → 日期（吸附到最近的 bar / 采样点） */
+    _dateAtX(x) {
+      const g = this._geomCache;
+      if (!g) return NaN;
+      if (g.intraday) {
+        const d = this.intraday;
+        if (!d?.t?.length || !g.xs) return NaN;
+        let bi = 0;
+        let bd = Infinity;
+        for (let i = 0; i < g.xs.length; i++) {
+          const dd = Math.abs(g.xs[i] - x);
+          if (dd < bd) { bd = dd; bi = i; }
+        }
+        return d.t[bi] * 1000;
+      }
+      if (!g.view?.length) return NaN;
+      const raw = Math.round((x - g.padL) / g.step - 0.5);
+      const i = Math.max(0, Math.min(g.n - 1, raw));
+      return g.view[i].date_ms;
+    }
+
+    /** 价格 → 屏幕 y */
+    _yOfPrice(p) {
+      const g = this._geomCache;
+      if (!g) return NaN;
+      const h = g.priceBot - g.priceTop;
+      if (!h) return NaN;
+      if (g.intraday) {
+        const pc = g.pc || 0;
+        if (!pc || !g.maxAbs) return NaN;
+        const dev = ((p - pc) / pc) * 100;
+        return g.priceBot - ((dev + g.maxAbs) / (2 * g.maxAbs)) * h;
+      }
+      return g.priceBot - ((p - g.lo) / (g.hi - g.lo)) * h;
+    }
+
+    /** 屏幕 y → 价格 */
+    _priceAtY(y) {
+      const g = this._geomCache;
+      if (!g) return NaN;
+      const h = g.priceBot - g.priceTop;
+      if (!h) return NaN;
+      if (g.intraday) {
+        const pc = g.pc || 0;
+        if (!pc || !g.maxAbs) return NaN;
+        const dev = ((g.priceBot - y) / h) * 2 * g.maxAbs - g.maxAbs;
+        return pc * (1 + dev / 100);
+      }
+      return g.lo + ((g.priceBot - y) / h) * (g.hi - g.lo);
+    }
+
+    /** 一条画记的屏幕坐标（超范围的点会被 canvas 裁剪掉） */
+    _annotationPts(a) {
+      const out = [];
+      for (const p of a.points ?? []) {
+        const x = this._xOfDate(p.date_ms);
+        const y = this._yOfPrice(p.price);
+        if (Number.isFinite(x) && Number.isFinite(y)) out.push({ x, y });
+      }
+      return out;
+    }
+
+    /** 把画记（含正在画的草稿）画到画布上 */
+    _renderAnnotations(ctx) {
+      const list = this._draft ? [...this.annotations, this._draft] : this.annotations;
+      if (!list.length) return;
+      const wrap = this.canvas.parentElement;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, wrap.clientWidth, wrap.clientHeight);
+      ctx.clip();
+      for (const a of list) {
+        const pts = this._annotationPts(a);
+        if (pts.length < 2) continue;
+        const color = a.color || '#e8b339';
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = a.width || 2;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+
+        if (a.tool === 'rect') {
+          const p0 = pts[0];
+          const p1 = pts[pts.length - 1];
+          ctx.strokeRect(Math.min(p0.x, p1.x), Math.min(p0.y, p1.y), Math.abs(p1.x - p0.x), Math.abs(p1.y - p0.y));
+        } else if (a.tool === 'arrow') {
+          const p0 = pts[0];
+          const p1 = pts[pts.length - 1];
+          ctx.beginPath();
+          ctx.moveTo(p0.x, p0.y);
+          ctx.lineTo(p1.x, p1.y);
+          ctx.stroke();
+          const ang = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+          const head = Math.max(8, (a.width || 2) * 4);
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p1.x - head * Math.cos(ang - Math.PI / 7), p1.y - head * Math.sin(ang - Math.PI / 7));
+          ctx.lineTo(p1.x - head * Math.cos(ang + Math.PI / 7), p1.y - head * Math.sin(ang + Math.PI / 7));
+          ctx.closePath();
+          ctx.fill();
+        } else {
+          // 直线与自由曲线都是折线
+          ctx.beginPath();
+          pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    /** 命中测试：返回被点到的画记下标，-1 表示没点到 */
+    _hitAnnotation(x, y, tol = 8) {
+      for (let k = this.annotations.length - 1; k >= 0; k--) {
+        const a = this.annotations[k];
+        const pts = this._annotationPts(a);
+        if (pts.length < 2) continue;
+        if (a.tool === 'rect') {
+          const x0 = Math.min(pts[0].x, pts[pts.length - 1].x);
+          const x1 = Math.max(pts[0].x, pts[pts.length - 1].x);
+          const y0 = Math.min(pts[0].y, pts[pts.length - 1].y);
+          const y1 = Math.max(pts[0].y, pts[pts.length - 1].y);
+          const d = Math.min(
+            distToSeg(x, y, x0, y0, x1, y0),
+            distToSeg(x, y, x1, y0, x1, y1),
+            distToSeg(x, y, x1, y1, x0, y1),
+            distToSeg(x, y, x0, y1, x0, y0),
+          );
+          if (d <= tol) return k;
+        } else {
+          for (let i = 1; i < pts.length; i++) {
+            if (distToSeg(x, y, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y) <= tol) return k;
+          }
+        }
+      }
+      return -1;
+    }
+
+    _localXY(e) {
+      const r = this.canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+
+    _onDown(e) {
+      if (!this.drawTool || !this._geomCache) return;
+      const { x, y } = this._localXY(e);
+
+      if (this.drawTool === 'erase') {
+        const k = this._hitAnnotation(x, y);
+        if (k >= 0) {
+          this.annotations.splice(k, 1);
+          this.draw();
+          if (this.opts.onAnnotationsChange) this.opts.onAnnotationsChange(this.annotations);
+        }
+        return;
+      }
+
+      const g = this._geomCache;
+      const w = this.canvas.parentElement.clientWidth;
+      if (x < g.padL || x > w - g.padR || y < g.priceTop || y > g.volBot) return;
+
+      const pt = { date_ms: this._dateAtX(x), price: this._priceAtY(y) };
+      if (!Number.isFinite(pt.date_ms) || !Number.isFinite(pt.price) || pt.price <= 0) return;
+
+      this._drawing = true;
+      this._draft = {
+        tool: this.drawTool,
+        color: this.drawColor,
+        width: this.drawWidth,
+        // 直线/箭头/方框先放两个相同的点，拖动时替换第二个；
+        // 自由曲线只放一个，后续按像素距离追加
+        points: this.drawTool === 'free' ? [pt] : [pt, { ...pt }],
+      };
+      this.draw();
+    }
+
+    _onUp() {
+      if (!this._drawing) return;
+      this._drawing = false;
+      const d = this._draft;
+      this._draft = null;
+      if (d && d.points.length >= 2) {
+        d.points = downsample(d.points, 600); // 兜一层点数上限
+        d.id = `a${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        this.annotations.push(d);
+        if (this.opts.onAnnotationsChange) this.opts.onAnnotationsChange(this.annotations);
+      }
+      this.draw();
+    }
+
+    /** 清空画记，返回清掉了多少条 */
+    clearAnnotations() {
+      const n = this.annotations.length;
+      this.annotations = [];
+      this._draft = null;
+      this._drawing = false;
+      this.draw();
+      if (n && this.opts.onAnnotationsChange) this.opts.onAnnotationsChange(this.annotations);
+      return n;
     }
 
     draw() {
@@ -722,6 +1052,9 @@
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
       ctx.fillText(tagText, W - padR + 7, tagY);
+
+      // ---- 画笔画记（画在图形之上、十字光标之下）
+      this._renderAnnotations(ctx);
 
       // ---- 十字光标
       if (this.hoverIndex !== null && this.hoverIndex < n) {

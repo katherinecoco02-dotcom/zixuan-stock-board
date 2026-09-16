@@ -24,6 +24,8 @@ const el = {
   chartInfo: $('chart-info'),
   chartWrap: $('chart-wrap'),
   canvas: $('chart'),
+  drawBar: $('draw-bar'),
+  drawToggle: $('draw-toggle'),
   empty: $('chart-empty'),
   loading: $('chart-loading'),
   stats: $('stats'),
@@ -559,7 +561,39 @@ const PERIOD_LABEL = window.KLINE_PERIOD_LABEL;
 const mainChart = new KlineChart(el.canvas, {
   onHover: (info) => (info ? setChartInfo(info) : resetChartInfo()),
   onViewChange: () => updateStats(),   // 滚轮缩放后刷新底部统计
+  onAnnotationsChange: (list) => stashAnnotations(list),
 });
+
+// ---------------------------------------------------------------- 画笔（纯前端内存）
+
+/**
+ * 画记按股票分别暂存在内存里。**按需求不做持久化**：
+ * 刷新页面、关掉标签页就没了，也不写服务端 —— 不给服务端加状态、不占磁盘。
+ */
+const annotationsByCode = new Map();
+let drawTool = null;          // null = 画笔关闭
+let drawColor = '#e8b339';
+let drawWidth = 2;
+
+function currentAnnotations() {
+  return state.selected ? (annotationsByCode.get(state.selected) ?? []) : [];
+}
+
+function stashAnnotations(list) {
+  if (!state.selected) return;
+  if (Array.isArray(list) && list.length) annotationsByCode.set(state.selected, list);
+  else annotationsByCode.delete(state.selected);
+}
+
+/** 开关画笔：开启时沿用上次选中的工具与颜色 */
+function setDrawEnabled(on) {
+  drawTool = on ? (drawTool || 'line') : null;
+  mainChart.setDrawTool(drawTool);
+  el.drawBar.hidden = !on;
+  el.drawToggle.classList.toggle('active', on);
+  el.drawToggle.textContent = on ? '✏ 画笔（开）' : '✏ 画笔';
+  if (on) mainChart.setDrawStyle({ color: drawColor, width: drawWidth });
+}
 
 /** 当前显示窗口内的 bar（`displayStartMs` 之前的是服务端多取的均线预热数据） */
 function displayedBars(items, displayStartMs) {
@@ -644,6 +678,7 @@ function renderMainChart() {
   if (bars.length < 2) return showEmpty(state.selected ? '暂无 K 线数据' : '从左侧选择一只股票');
 
   el.empty.hidden = true;
+  mainChart.setAnnotations(currentAnnotations()); // 切股票时换上该股的画记
   mainChart.setData({
     items: bars,
     displayStartMs: k.displayStartMs,
@@ -703,6 +738,7 @@ function renderMainIntraday() {
   if (!d.hasData) return showEmpty(d.reason ? `暂无分时：${d.reason}` : '暂无分时数据');
 
   el.empty.hidden = true;
+  mainChart.setAnnotations(currentAnnotations());
   mainChart.setIntraday(d);
   resetChartInfo();
   updateStats();
@@ -1198,8 +1234,8 @@ function renderReview() {
     <h2>情绪概览 <span class="dim">${esc(tradeDate)}</span></h2>
     <div class="emotion">
       <div><b class="up">${p.limitUpTotal ?? p.limitUp.length}</b><span>涨停</span></div>
-      <div><b class="down">${p.limitDown.length}</b><span>跌停</span></div>
-      <div><b class="amber">${p.limitBreak.length}</b><span>炸板</span></div>
+      <div><b class="down">${p.limitDownTotal ?? p.limitDown.length}</b><span>跌停</span></div>
+      <div><b class="amber">${p.limitBreakTotal ?? p.limitBreak.length}</b><span>炸板</span></div>
       <div><b>${p.ladder ? ladderCount(p.ladder) : 0}</b><span>连板</span></div>
     </div>
   </section>`);
@@ -1939,6 +1975,45 @@ let resizeTimer = null;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(redrawAllCharts, 120);
+});
+
+// ---------------------------------------------------------------- 画笔交互
+
+el.drawToggle.addEventListener('click', () => setDrawEnabled(el.drawBar.hidden));
+
+el.drawBar.addEventListener('click', (e) => {
+  const toolBtn = e.target.closest('button[data-tool]');
+  if (toolBtn) {
+    drawTool = toolBtn.dataset.tool;
+    mainChart.setDrawTool(drawTool);
+    for (const b of $('draw-tools').children) b.classList.toggle('active', b === toolBtn);
+    return;
+  }
+  const colorBtn = e.target.closest('button[data-color]');
+  if (colorBtn) {
+    drawColor = colorBtn.dataset.color;
+    mainChart.setDrawStyle({ color: drawColor });
+    for (const b of $('draw-colors').children) b.classList.toggle('active', b === colorBtn);
+    return;
+  }
+  const widthBtn = e.target.closest('button[data-width]');
+  if (widthBtn) {
+    drawWidth = Number(widthBtn.dataset.width) || 2;
+    mainChart.setDrawStyle({ width: drawWidth });
+    for (const b of $('draw-widths').children) b.classList.toggle('active', b === widthBtn);
+  }
+});
+
+$('draw-undo').addEventListener('click', () => {
+  const list = mainChart.annotations;
+  if (!list.length) return;
+  list.pop();
+  stashAnnotations(list);
+  mainChart.draw();
+});
+
+$('draw-clear').addEventListener('click', () => {
+  mainChart.clearAnnotations(); // 内部会回调 onAnnotationsChange 完成暂存
 });
 
 // ---------------------------------------------------------------- 启动

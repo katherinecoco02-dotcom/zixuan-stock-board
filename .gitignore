@@ -13,6 +13,9 @@ credentials.env
 # data/ 里是使用者自己的自选股、价格预警、运行日志与 pid
 # 每个使用者各不相同，且属于隐私，绝不进仓库
 /data/
+# 测试用的隔离数据目录（data-test / data-test2 / …）——
+# 忘了清理时也不能被提交
+/data-test*/
 
 # ---- 记忆与 agent 配置（本地私有，见 ~/.dsh/AGENTS.md）----
 /memory/
